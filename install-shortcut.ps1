@@ -1,28 +1,26 @@
-# AtomArcade — desktop shortcut installer (v0.5).
+# AtomArcade — desktop shortcut installer (v0.5.1).
 #
 # Creates "AtomArcade Home Base.lnk" on the user's Desktop.
-# v0.5 makes the browser Automation Center (homebase.ps1) the canonical
-# Home Base surface. homebase-desktop.ps1 is retained only as a compatibility
-# launcher for existing shortcuts.
+# The shortcut targets homebase-desktop.ps1 because that launcher starts the
+# browser Automation Center server and opens http://localhost:8080/.
 #
-# Usage (run once from the repo folder):
+# Usage from the repo folder:
 #   pwsh -File install-shortcut.ps1
-# Re-run after `git pull` if file paths changed.
 
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = $PSScriptRoot
+$Launcher = Join-Path $RepoRoot 'homebase-desktop.ps1'
 $Browser  = Join-Path $RepoRoot 'homebase.ps1'
-$Compat   = Join-Path $RepoRoot 'homebase-desktop.ps1'
 
-if (Test-Path $Browser) {
+if (Test-Path $Launcher) {
+    $Target = $Launcher
+    Write-Host 'Target: homebase-desktop.ps1 (opens browser Automation Center)'
+} elseif (Test-Path $Browser) {
     $Target = $Browser
-    Write-Host 'Target: homebase.ps1 (browser Automation Center)'
-} elseif (Test-Path $Compat) {
-    $Target = $Compat
-    Write-Host 'Target: homebase-desktop.ps1 (compatibility launcher)'
+    Write-Host 'Target: homebase.ps1 (server only fallback)'
 } else {
-    throw "Neither homebase.ps1 nor homebase-desktop.ps1 found in $RepoRoot. Did you 'git clone' first?"
+    throw "Neither homebase-desktop.ps1 nor homebase.ps1 found in $RepoRoot. Did you 'git clone' first?"
 }
 
 # Find a PowerShell executable (prefer pwsh 7+)

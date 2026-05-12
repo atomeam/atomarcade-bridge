@@ -1,23 +1,21 @@
 # ============================================================
-# AtomArcade Home Base — Desktop Compatibility Launcher (v0.5)
+# AtomArcade Home Base — Desktop Launcher (v0.5.1)
 # ============================================================
-# The live operator surface is now the browser Automation Center in homebase.ps1.
-# This file remains because existing desktop shortcuts target homebase-desktop.ps1.
-# Running it will start the v0.5 browser Home Base server if needed, then open
-# http://localhost:8080/.
+# Starts the browser Automation Center in homebase.ps1 when needed, then opens
+# http://localhost:8080/ in the default browser.
 # ============================================================
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$Version = 'v0.5-desktop-launcher'
+$Version = 'v0.5.1-desktop-launcher'
 $Port    = 8080
 $Url     = "http://localhost:$Port/"
-$ApiUrl  = "${Url}api/status"
+$HealthUrl = "${Url}api/soak/status"
 $Script  = Join-Path $PSScriptRoot 'homebase.ps1'
 
 function Test-HomeBaseUp {
     try {
-        $r = Invoke-WebRequest -Uri $ApiUrl -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+        $r = Invoke-WebRequest -Uri $HealthUrl -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
         return ($r.StatusCode -eq 200)
     } catch {
         return $false
@@ -46,9 +44,9 @@ if (-not (Test-Path $Script)) {
 }
 
 if (-not (Test-HomeBaseUp)) {
-    $pwsh = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
+    $pwsh = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
     if (-not $pwsh) {
-        $pwsh = (Get-Command powershell -ErrorAction SilentlyContinue)?.Source
+        $pwsh = (Get-Command powershell -ErrorAction SilentlyContinue).Source
     }
 
     if (-not $pwsh) {
@@ -57,7 +55,7 @@ if (-not (Test-HomeBaseUp)) {
     }
 
     Start-Process -FilePath $pwsh `
-        -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File', "`"$Script`"") `
+        -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File', $Script) `
         -WorkingDirectory $PSScriptRoot `
         -WindowStyle Minimized
 
@@ -68,10 +66,13 @@ if (-not (Test-HomeBaseUp)) {
     }
 }
 
+# Always try to open the browser, even if the health endpoint did not answer.
+# If the server is still booting, the browser can be refreshed manually.
+Start-Process $Url
+
 if (Test-HomeBaseUp) {
-    Start-Process $Url
     exit 0
 }
 
-Show-ErrorMessage "Home Base did not respond on $ApiUrl after launch attempt.`n`nRun manually to inspect errors:`n`npwsh -File `"$Script`""
+Show-ErrorMessage "Home Base browser was opened, but the local server did not answer $HealthUrl yet.`n`nIf the browser does not load after a refresh, run manually:`n`npwsh -File `"$Script`""
 exit 1
