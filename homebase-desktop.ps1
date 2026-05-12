@@ -1,7 +1,7 @@
 # ============================================================
-# AtomArcade Home Base — Desktop (v0.3)
+# AtomArcade Home Base — Desktop (v0.4)
 # Single-file Windows Forms app. No HTTP server, no browser.
-# Embedded Notion Command Bus + RetroArch UDP client.
+# Embedded Notion Command Bus + Automations scheduler + RetroArch UDP.
 # ============================================================
 
 # --- Hide the console window PowerShell shows by default ---
@@ -25,16 +25,21 @@ $ErrorActionPreference = 'Continue'
 # ============================================================
 # Config
 # ============================================================
-$VERSION         = 'v0.3-desktop'
-$RA_HOST         = '127.0.0.1'
-$RA_PORT         = 55355
-$UDP_TIMEOUT_MS  = 250
-$NOTION_POLL_SEC = 5
-$STATUS_POLL_MS  = 2000
-$LOG_MAX         = 500
-$NOTION_TOKEN    = $env:ATOMARCADE_NOTION_TOKEN
-$NOTION_DB_ID    = $env:ATOMARCADE_NOTION_DB_ID
-$NOTION_ENABLED  = (-not [string]::IsNullOrWhiteSpace($NOTION_TOKEN)) -and (-not [string]::IsNullOrWhiteSpace($NOTION_DB_ID))
+$VERSION          = 'v0.4-desktop'
+$RA_HOST          = '127.0.0.1'
+$RA_PORT          = 55355
+$UDP_TIMEOUT_MS   = 250
+$NOTION_POLL_SEC  = 5
+$STATUS_POLL_MS   = 2000
+$LOG_MAX          = 500
+$AUTO_REFRESH_SEC = 300   # how often to re-read the Automations DB
+$AUTO_TICK_SEC    = 30    # how often to evaluate due automations
+
+$NOTION_TOKEN   = $env:ATOMARCADE_NOTION_TOKEN
+$NOTION_DB_ID   = $env:ATOMARCADE_NOTION_DB_ID
+$AUTO_DB_ID     = $env:ATOMARCADE_NOTION_AUTO_DB_ID
+$NOTION_ENABLED = (-not [string]::IsNullOrWhiteSpace($NOTION_TOKEN)) -and (-not [string]::IsNullOrWhiteSpace($NOTION_DB_ID))
+$AUTO_ENABLED   = (-not [string]::IsNullOrWhiteSpace($NOTION_TOKEN)) -and (-not [string]::IsNullOrWhiteSpace($AUTO_DB_ID))
 
 $CURATOR_POLICY = @{
     'retroarch'  = $true
@@ -50,10 +55,13 @@ $ALLOW_HIGH_RISK = ($env:ATOMARCADE_ALLOW_HIGH_RISK -eq '1')
 # ============================================================
 # State
 # ============================================================
-$script:Log            = [System.Collections.Generic.List[string]]::new()
-$script:Started        = Get-Date
-$script:Hostname       = $env:COMPUTERNAME
-$script:LastNotionPoll = [datetime]::MinValue
+$script:Log             = [System.Collections.Generic.List[string]]::new()
+$script:Started         = Get-Date
+$script:Hostname        = $env:COMPUTERNAME
+$script:LastNotionPoll  = [datetime]::MinValue
+$script:Automations     = @()
+$script:LastAutoRefresh = [datetime]::MinValue
+$script:LastAutoTick    = [datetime]::MinValue
 
 function Log-Add($kind, $msg) {
     $ts = (Get-Date).ToString('HH:mm:ss')
@@ -84,7 +92,7 @@ function Send-RA([string]$cmd) {
 }
 
 # ============================================================
-# Whitelisted dispatcher
+# Whitelisted dispatcher (shared by Notion bus + Automations)
 # ============================================================
 function Invoke-Bridge([string]$cmd, [string]$kind, [string]$risk) {
     if (-not $CURATOR_POLICY[$kind]) {
@@ -132,6 +140,17 @@ function Get-Prop($p) {
     if ($p.rich_text -and $p.rich_text.Count -gt 0) { return ($p.rich_text | ForEach-Object { $_.plain_text }) -join '' }
     if ($p.select)                                  { return $p.select.name }
     return $null
+}
+
+function Get-Num($p) {
+    if (-not $p) { return $null }
+    if ($null -ne $p.number) { return [double]$p.number }
+    return $null
+}
+
+function Get-DateProp($p) {
+    if (-not $p -or -not $p.date -or -not $p.date.start) { return $null }
+    try { return [datetime]::Parse($p.date.start) } catch { return $null }
 }
 
 function Update-Row($pageId, $status, $result, $stamp) {
@@ -185,6 +204,84 @@ function Tick-Notion {
 }
 
 # ============================================================
+# Automations (Notion-backed scheduler)
+# ============================================================
+function Refresh-Automations {
+    if (-not $AUTO_ENABLED) { return }
+    try {
+        $body = @{
+            filter    = @{ property = 'Enabled'; checkbox = @{ equals = $true } }
+            page_size = 100
+        } | ConvertTo-Json -Depth 6
+        $r = Invoke-RestMethod -Uri "https://api.notion.com/v1/databases/$AUTO_DB_ID/query" `
+             -Method Post -Headers $script:NotionHeaders -Body $body -TimeoutSec 10
+        $list = @()
+        foreach ($row in $r.results) {
+            $name     = Get-Prop $row.properties.Name
+            $command  = Get-Prop $row.properties.Command
+            $kind     = Get-Prop $row.properties.Kind
+            $risk     = Get-Prop $row.properties.Risk
+            $interval = Get-Num  $row.properties.'Interval (sec)'
+            $runCount = Get-Num  $row.properties.'Run Count'
+            $lastRun  = Get-DateProp $row.properties.'Last Run'
+            if (-not $command -or -not $kind -or -not $interval) { continue }
+            if ($interval -lt 30) { $interval = 30 }
+            if (-not $risk) { $risk = 'low' }
+            if (-not $runCount) { $runCount = 0 }
+            $list += [pscustomobject]@{
+                Id       = $row.id
+                Name     = $name
+                Command  = $command
+                Kind     = $kind
+                Risk     = $risk
+                Interval = [int]$interval
+                RunCount = [int]$runCount
+                LastRun  = $lastRun
+            }
+        }
+        $script:Automations     = $list
+        $script:LastAutoRefresh = Get-Date
+        Log-Add 'AUTO' "refresh: $($list.Count) enabled"
+    } catch {
+        Log-Add 'AUTO_ERR' $_.Exception.Message
+    }
+}
+
+function Update-AutomationRow($pageId, $lastRun, $runCount, $result) {
+    $t = if ($result.Length -gt 1900) { $result.Substring(0,1900) + '...' } else { $result }
+    $body = @{
+        properties = @{
+            'Last Run'    = @{ date = @{ start = $lastRun.ToString('o') } }
+            'Last Result' = @{ rich_text = @(@{ text = @{ content = $t } }) }
+            'Run Count'   = @{ number = $runCount }
+        }
+    } | ConvertTo-Json -Depth 8
+    Invoke-RestMethod -Uri "https://api.notion.com/v1/pages/$pageId" `
+        -Method Patch -Headers $script:NotionHeaders -Body $body -TimeoutSec 10 | Out-Null
+}
+
+function Tick-Automations {
+    if (-not $AUTO_ENABLED) { return }
+    $now = Get-Date
+    foreach ($a in $script:Automations) {
+        $due = $false
+        if (-not $a.LastRun) { $due = $true }
+        elseif (($now - $a.LastRun).TotalSeconds -ge $a.Interval) { $due = $true }
+        if (-not $due) { continue }
+        Log-Add 'AUTO' "$($a.Name) -> $($a.Kind)/$($a.Command)"
+        try {
+            $res     = Invoke-Bridge $a.Command $a.Kind $a.Risk
+            $resJson = $res | ConvertTo-Json -Depth 4 -Compress
+            $a.LastRun  = $now
+            $a.RunCount = $a.RunCount + 1
+            Update-AutomationRow $a.Id $now $a.RunCount $resJson
+        } catch {
+            Log-Add 'AUTO_ERR' "$($a.Name): $($_.Exception.Message)"
+        }
+    }
+}
+
+# ============================================================
 # UI
 # ============================================================
 $ColBg     = [System.Drawing.Color]::FromArgb(11,13,16)
@@ -200,8 +297,8 @@ $Mono      = New-Object System.Drawing.Font('Consolas', 9)
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "AtomArcade Home Base $VERSION"
-$form.Size = New-Object System.Drawing.Size(820, 600)
-$form.MinimumSize = New-Object System.Drawing.Size(640, 480)
+$form.Size = New-Object System.Drawing.Size(820, 620)
+$form.MinimumSize = New-Object System.Drawing.Size(640, 500)
 $form.StartPosition = 'CenterScreen'
 $form.BackColor = $ColBg
 $form.ForeColor = $ColText
@@ -212,30 +309,35 @@ $statusBox = New-Object System.Windows.Forms.GroupBox
 $statusBox.Text = 'STATUS'
 $statusBox.ForeColor = $ColMuted
 $statusBox.Location = New-Object System.Drawing.Point(10,10)
-$statusBox.Size = New-Object System.Drawing.Size(795,90)
+$statusBox.Size = New-Object System.Drawing.Size(795,115)
 $statusBox.Anchor = 'Top,Left,Right'
 $form.Controls.Add($statusBox)
 
 $lblBridge = New-Object System.Windows.Forms.Label
 $lblBridge.Location = New-Object System.Drawing.Point(10,25); $lblBridge.Size = New-Object System.Drawing.Size(780,18)
-$lblBridge.Text = 'Bridge:     booting...'
+$lblBridge.Text = 'Bridge:      booting...'
 $statusBox.Controls.Add($lblBridge)
 
 $lblRA = New-Object System.Windows.Forms.Label
 $lblRA.Location = New-Object System.Drawing.Point(10,45); $lblRA.Size = New-Object System.Drawing.Size(780,18)
-$lblRA.Text = 'RetroArch:  -'
+$lblRA.Text = 'RetroArch:   -'
 $statusBox.Controls.Add($lblRA)
 
 $lblBus = New-Object System.Windows.Forms.Label
 $lblBus.Location = New-Object System.Drawing.Point(10,65); $lblBus.Size = New-Object System.Drawing.Size(780,18)
-$lblBus.Text = 'Notion bus: -'
+$lblBus.Text = 'Notion bus:  -'
 $statusBox.Controls.Add($lblBus)
+
+$lblAuto = New-Object System.Windows.Forms.Label
+$lblAuto.Location = New-Object System.Drawing.Point(10,85); $lblAuto.Size = New-Object System.Drawing.Size(780,18)
+$lblAuto.Text = 'Automations: -'
+$statusBox.Controls.Add($lblAuto)
 
 # --- Buttons panel ---
 $btnPanel = New-Object System.Windows.Forms.GroupBox
 $btnPanel.Text = 'CONTROL'
 $btnPanel.ForeColor = $ColMuted
-$btnPanel.Location = New-Object System.Drawing.Point(10,110)
+$btnPanel.Location = New-Object System.Drawing.Point(10,135)
 $btnPanel.Size = New-Object System.Drawing.Size(795,100)
 $btnPanel.Anchor = 'Top,Left,Right'
 $form.Controls.Add($btnPanel)
@@ -258,7 +360,7 @@ $btnPanel.Controls.Add((Make-Btn 'Pause/Resume' 10  25 110 { $r = Send-RA 'PAUSE
 $btnPanel.Controls.Add((Make-Btn 'Save State'   125 25 100 { $r = Send-RA 'SAVE_STATE';   Log-Add 'UI' ("SAVE_STATE -> " + $(if ($r.ok) {'ok'} else {$r.error})) }))
 $btnPanel.Controls.Add((Make-Btn 'Load State'   230 25 100 { $r = Send-RA 'LOAD_STATE';   Log-Add 'UI' ("LOAD_STATE -> " + $(if ($r.ok) {'ok'} else {$r.error})) }))
 $btnPanel.Controls.Add((Make-Btn 'Screenshot'   335 25 100 { $r = Send-RA 'SCREENSHOT';   Log-Add 'UI' ("SCREENSHOT -> " + $(if ($r.ok) {'ok'} else {$r.error})) }))
-$btnPanel.Controls.Add((Make-Btn 'Fast-Fwd'     440 25  95 { $r = Send-RA 'FAST_FORWARD'; Log-Add 'UI' "FAST_FORWARD" }))
+$btnPanel.Controls.Add((Make-Btn 'Fast-Fwd'     440 25  95 { $r = Send-RA 'FAST_FORWARD'; Log-Add 'UI' 'FAST_FORWARD' }))
 $btnPanel.Controls.Add((Make-Btn 'Menu'         540 25  70 { $r = Send-RA 'MENU_TOGGLE'; Log-Add 'UI' 'MENU_TOGGLE' }))
 $btnPanel.Controls.Add((Make-Btn 'Mute'         615 25  60 { $r = Send-RA 'MUTE'; Log-Add 'UI' 'MUTE' }))
 $btnPanel.Controls.Add((Make-Btn 'Quit RA'      680 25 100 {
@@ -294,15 +396,15 @@ $txtRaw.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $btnSend.PerformClick(); $_.
 $logBox = New-Object System.Windows.Forms.GroupBox
 $logBox.Text = 'EVENT LOG'
 $logBox.ForeColor = $ColMuted
-$logBox.Location = New-Object System.Drawing.Point(10,220)
-$logBox.Size = New-Object System.Drawing.Size(795,330)
+$logBox.Location = New-Object System.Drawing.Point(10,245)
+$logBox.Size = New-Object System.Drawing.Size(795,325)
 $logBox.Anchor = 'Top,Left,Right,Bottom'
 $form.Controls.Add($logBox)
 
 $logCtrl = New-Object System.Windows.Forms.TextBox
 $logCtrl.Multiline = $true; $logCtrl.ScrollBars = 'Vertical'; $logCtrl.ReadOnly = $true
 $logCtrl.Location = New-Object System.Drawing.Point(10,22)
-$logCtrl.Size = New-Object System.Drawing.Size(775,300)
+$logCtrl.Size = New-Object System.Drawing.Size(775,295)
 $logCtrl.Anchor = 'Top,Left,Right,Bottom'
 $logCtrl.BackColor = $ColBg; $logCtrl.ForeColor = $ColText; $logCtrl.BorderStyle = 'FixedSingle'; $logCtrl.Font = $Mono
 $logBox.Controls.Add($logCtrl)
@@ -313,6 +415,12 @@ if ($NOTION_ENABLED) {
     Log-Add 'BOOT' ("Notion bus enabled. DB " + $NOTION_DB_ID.Substring(0,[Math]::Min(8,$NOTION_DB_ID.Length)) + '...')
 } else {
     Log-Add 'BOOT' 'Notion bus DISABLED — set ATOMARCADE_NOTION_TOKEN + ATOMARCADE_NOTION_DB_ID env vars'
+}
+if ($AUTO_ENABLED) {
+    Log-Add 'BOOT' ("Automations enabled. DB " + $AUTO_DB_ID.Substring(0,[Math]::Min(8,$AUTO_DB_ID.Length)) + '...')
+    Refresh-Automations
+} else {
+    Log-Add 'BOOT' 'Automations DISABLED — set ATOMARCADE_NOTION_AUTO_DB_ID env var'
 }
 if ($ALLOW_HIGH_RISK) { Log-Add 'BOOT' 'High-risk commands ARMED' }
 
@@ -327,33 +435,63 @@ $timer.Add_Tick({
         $state   = if ($parts.Length -ge 2) { $parts[1] } else { '?' }
         $system  = if ($parts.Length -ge 3) { $parts[2] } else { '-' }
         $content = if ($parts.Length -ge 4) { $parts[3] } else { '-' }
-        $lblRA.Text = "RetroArch:  $state   $system   $content"
+        $lblRA.Text = "RetroArch:   $state   $system   $content"
         $lblRA.ForeColor = $ColOk
     } elseif ($ping.ok) {
-        $lblRA.Text = "RetroArch:  not responding on UDP $($RA_PORT) (is RetroArch running with network_cmd_enable=true?)"
+        $lblRA.Text = "RetroArch:   not responding on UDP $($RA_PORT) (is RetroArch running with network_cmd_enable=true?)"
         $lblRA.ForeColor = $ColWarn
     } else {
-        $lblRA.Text = "RetroArch:  error: $($ping.error)"
+        $lblRA.Text = "RetroArch:   error: $($ping.error)"
         $lblRA.ForeColor = $ColErr
     }
 
     # Bridge
     $up = [int]((Get-Date)-$script:Started).TotalSeconds
-    $lblBridge.Text = "Bridge:     $VERSION   uptime ${up}s   host $($script:Hostname)"
+    $lblBridge.Text = "Bridge:      $VERSION   uptime ${up}s   host $($script:Hostname)"
     $lblBridge.ForeColor = $ColOk
 
-    # Notion poll
+    # Notion bus poll
     if ($NOTION_ENABLED) {
         if (((Get-Date) - $script:LastNotionPoll).TotalSeconds -ge $NOTION_POLL_SEC) {
             $script:LastNotionPoll = Get-Date
             Tick-Notion
         }
         $dbShort = $NOTION_DB_ID.Substring(0,[Math]::Min(8,$NOTION_DB_ID.Length))
-        $lblBus.Text = "Notion bus: enabled   last poll $($script:LastNotionPoll.ToString('HH:mm:ss'))   db ${dbShort}..."
+        $lblBus.Text = "Notion bus:  enabled   last poll $($script:LastNotionPoll.ToString('HH:mm:ss'))   db ${dbShort}..."
         $lblBus.ForeColor = $ColOk
     } else {
-        $lblBus.Text = 'Notion bus: DISABLED — set ATOMARCADE_NOTION_TOKEN + ATOMARCADE_NOTION_DB_ID env vars'
+        $lblBus.Text = 'Notion bus:  DISABLED — set ATOMARCADE_NOTION_TOKEN + ATOMARCADE_NOTION_DB_ID env vars'
         $lblBus.ForeColor = $ColWarn
+    }
+
+    # Automations
+    if ($AUTO_ENABLED) {
+        if (((Get-Date) - $script:LastAutoRefresh).TotalSeconds -ge $AUTO_REFRESH_SEC) {
+            Refresh-Automations
+        }
+        if (((Get-Date) - $script:LastAutoTick).TotalSeconds -ge $AUTO_TICK_SEC) {
+            $script:LastAutoTick = Get-Date
+            Tick-Automations
+        }
+        $count = $script:Automations.Count
+        if ($count -gt 0) {
+            $nextName = $null; $nextSec = [int]::MaxValue
+            $now = Get-Date
+            foreach ($a in $script:Automations) {
+                if (-not $a.LastRun) { $sec = 0 }
+                else { $sec = [int]($a.Interval - ($now - $a.LastRun).TotalSeconds) }
+                if ($sec -lt $nextSec) { $nextSec = $sec; $nextName = $a.Name }
+            }
+            if ($nextSec -lt 0) { $nextSec = 0 }
+            $lblAuto.Text = "Automations: $count enabled   next: $nextName in ${nextSec}s"
+            $lblAuto.ForeColor = $ColOk
+        } else {
+            $lblAuto.Text = 'Automations: 0 enabled (toggle some rows on in the Atomind Automations DB)'
+            $lblAuto.ForeColor = $ColWarn
+        }
+    } else {
+        $lblAuto.Text = 'Automations: DISABLED — set ATOMARCADE_NOTION_AUTO_DB_ID env var'
+        $lblAuto.ForeColor = $ColWarn
     }
 
     # Log render
