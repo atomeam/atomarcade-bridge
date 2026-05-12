@@ -1,5 +1,5 @@
-# AtomArcade Home Base — v0.5.2
-# Single-file PowerShell HTTP server + Notion Command Bus + Read-only Automation Center.
+# AtomArcade Home Base — v0.6.0
+# Single-file PowerShell HTTP server + Notion Command Bus + write-capable Automation Center.
 # Run with: pwsh -File homebase.ps1
 # Requires: PowerShell 7+, Windows, RetroArch with network_cmd_enable = "true".
 
@@ -13,10 +13,9 @@ $RETROARCH_HOST  = '127.0.0.1'
 $RETROARCH_PORT  = 55355
 $UDP_TIMEOUT_MS  = 800
 $LOG_MAX         = 500
-$VERSION         = 'v0.5.2-remote-ops'
+$VERSION         = 'v0.6.0-write-actions'
 
 # --- Notion Command Bus ---
-# Set these as machine/user env vars so the token never lives in the script file.
 $NOTION_TOKEN          = $env:ATOMARCADE_NOTION_TOKEN
 $NOTION_DATABASE_ID    = $env:ATOMARCADE_NOTION_DB_ID
 $NOTION_AUTO_DB_ID     = $env:ATOMARCADE_NOTION_AUTO_DB_ID
@@ -26,22 +25,19 @@ $NOTION_API_VERSION    = '2022-06-28'
 $NOTION_ENABLED        = -not [string]::IsNullOrWhiteSpace($NOTION_TOKEN) -and -not [string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)
 
 # --- Curator policy ---
-# Which command Kinds are allowed to execute. Flip to $false to hard-disable a kind.
-# 'high' Risk commands additionally require ATOMARCADE_ALLOW_HIGH_RISK=1.
 $CURATOR_POLICY = @{
     'retroarch'   = $true
     'capture'     = $true
     'observe'     = $true
     'diagnostic'  = $true
-    'shell-safe'  = $false   # opt-in: flip to $true after you allowlist commands below
+    'shell-safe'  = $false
     'curator'     = $true
     'system'      = $true
-    'git-pull'    = $true    # v0.5.2: ff-only pull from origin/main
-    'notion-log'  = $true    # v0.5.2: write a row to the Logs DB
+    'git-pull'    = $true
+    'notion-log'  = $true
 }
 $ALLOW_HIGH_RISK = ($env:ATOMARCADE_ALLOW_HIGH_RISK -eq '1')
 
-# Shell-safe allowlist. Only these exact tokens may run under Kind=shell-safe.
 $SHELL_SAFE_ALLOWLIST = @(
     'echo',
     'hostname',
@@ -50,7 +46,7 @@ $SHELL_SAFE_ALLOWLIST = @(
     'Get-Process retroarch'
 )
 
-# --- Remote-ops paths (v0.5.2) ---
+# --- Remote-ops paths ---
 $REPO_ROOT = $PSScriptRoot
 
 # ============================================================
@@ -156,7 +152,6 @@ function Invoke-NotionLog {
     $source    = if ($argsObj.source)  { [string]$argsObj.source }  else { 'home-base' }
     $payload   = if ($argsObj.payload) { [string]$argsObj.payload } else { '' }
 
-    # Truncate long fields to keep request well under Notion 2000-char rich_text limit.
     $maxLen = 1900
     if ($payload.Length -gt $maxLen) { $payload = $payload.Substring(0,$maxLen) + ' ...[truncated]' }
     if ($eventText.Length -gt 190)   { $eventText = $eventText.Substring(0,190) + '…' }
@@ -196,7 +191,6 @@ function Invoke-BridgeCommand {
         [string]$ArgsJson = $null
     )
 
-    # Curator gate
     if (-not $CURATOR_POLICY[$Kind]) {
         return @{ ok=$false; blocked=$true; reason="Curator: kind '$Kind' is disabled" }
     }
@@ -395,7 +389,6 @@ function Invoke-NotionDatabaseQuery {
     if ([string]::IsNullOrWhiteSpace($NOTION_TOKEN)) {
         return @{ ok = $false; error = "Missing ATOMARCADE_NOTION_TOKEN" }
     }
-
     if ([string]::IsNullOrWhiteSpace($DatabaseId)) {
         return @{ ok = $false; error = "Missing database id" }
     }
@@ -407,30 +400,22 @@ function Invoke-NotionDatabaseQuery {
         "Content-Type"   = "application/json"
     }
 
-    if ($Body.Count -eq 0) {
-        $Body = @{ page_size = 20 }
-    }
+    if ($Body.Count -eq 0) { $Body = @{ page_size = 20 } }
 
     try {
         $json = $Body | ConvertTo-Json -Depth 20
         $res = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $json -ErrorAction Stop
         return @{ ok = $true; data = $res }
-    }
-    catch {
-        return @{
-            ok = $false
-            error = $_.Exception.Message
-        }
+    } catch {
+        return @{ ok = $false; error = $_.Exception.Message }
     }
 }
 
 function Get-NotionHealth {
     $config = Get-ConfigStatus
-
     $cmd  = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_DATABASE_ID -Body @{ page_size = 1 }
     $auto = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_AUTO_DB_ID  -Body @{ page_size = 1 }
     $logs = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_LOG_DB_ID   -Body @{ page_size = 1 }
-
     return @{
         ok = ($cmd.ok -and $auto.ok -and $logs.ok)
         checked_at = (Get-Date).ToString("o")
@@ -444,22 +429,9 @@ function Get-NotionHealth {
 }
 
 function Get-AutomationsReadOnly {
-    $body = @{
-        page_size = 50
-        sorts = @(
-            @{
-                property = "Last Run"
-                direction = "descending"
-            }
-        )
-    }
-
+    $body = @{ page_size = 50; sorts = @(@{ property = "Last Run"; direction = "descending" }) }
     $res = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_AUTO_DB_ID -Body $body
-
-    if (-not $res.ok) {
-        return @{ ok = $false; error = $res.error; count = 0; rows = @() }
-    }
-
+    if (-not $res.ok) { return @{ ok = $false; error = $res.error; count = 0; rows = @() } }
     $rows = $res.data.results | ForEach-Object {
         $p = $_.properties
         @{
@@ -475,31 +447,13 @@ function Get-AutomationsReadOnly {
             last_result = Get-PlainText $p."Last Result".rich_text
         }
     }
-
-    return @{
-        ok = $true
-        count = @($rows).Count
-        rows = $rows
-    }
+    return @{ ok = $true; count = @($rows).Count; rows = $rows }
 }
 
 function Get-CommandsRecent {
-    $body = @{
-        page_size = 10
-        sorts = @(
-            @{
-                property = "Created At"
-                direction = "descending"
-            }
-        )
-    }
-
+    $body = @{ page_size = 10; sorts = @(@{ property = "Created At"; direction = "descending" }) }
     $res = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_DATABASE_ID -Body $body
-
-    if (-not $res.ok) {
-        return @{ ok = $false; error = $res.error; count = 0; rows = @() }
-    }
-
+    if (-not $res.ok) { return @{ ok = $false; error = $res.error; count = 0; rows = @() } }
     $rows = $res.data.results | ForEach-Object {
         $p = $_.properties
         @{
@@ -515,39 +469,22 @@ function Get-CommandsRecent {
             executed_at = $p."Executed At".date.start
         }
     }
-
-    return @{
-        ok = $true
-        count = @($rows).Count
-        rows = $rows
-    }
+    return @{ ok = $true; count = @($rows).Count; rows = $rows }
 }
 
 function Get-CommandsProblem {
     $body = @{
         page_size = 50
-        filter = @{
-            or = @(
-                @{ property = "Status"; select = @{ equals = "Pending" } }
-                @{ property = "Status"; select = @{ equals = "Running" } }
-                @{ property = "Status"; select = @{ equals = "Failed" } }
-                @{ property = "Status"; select = @{ equals = "Blocked" } }
-            )
-        }
-        sorts = @(
-            @{
-                property = "Created At"
-                direction = "descending"
-            }
-        )
+        filter = @{ or = @(
+            @{ property = "Status"; select = @{ equals = "Pending" } }
+            @{ property = "Status"; select = @{ equals = "Running" } }
+            @{ property = "Status"; select = @{ equals = "Failed" } }
+            @{ property = "Status"; select = @{ equals = "Blocked" } }
+        ) }
+        sorts = @(@{ property = "Created At"; direction = "descending" })
     }
-
     $res = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_DATABASE_ID -Body $body
-
-    if (-not $res.ok) {
-        return @{ ok = $false; error = $res.error; count = 0; rows = @() }
-    }
-
+    if (-not $res.ok) { return @{ ok = $false; error = $res.error; count = 0; rows = @() } }
     $rows = $res.data.results | ForEach-Object {
         $p = $_.properties
         @{
@@ -561,31 +498,13 @@ function Get-CommandsProblem {
             created_at = $p."Created At".created_time
         }
     }
-
-    return @{
-        ok = $true
-        count = @($rows).Count
-        rows = $rows
-    }
+    return @{ ok = $true; count = @($rows).Count; rows = $rows }
 }
 
 function Get-LogsRecent {
-    $body = @{
-        page_size = 20
-        sorts = @(
-            @{
-                property = "Timestamp"
-                direction = "descending"
-            }
-        )
-    }
-
+    $body = @{ page_size = 20; sorts = @(@{ property = "Timestamp"; direction = "descending" }) }
     $res = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_LOG_DB_ID -Body $body
-
-    if (-not $res.ok) {
-        return @{ ok = $false; error = $res.error; count = 0; rows = @() }
-    }
-
+    if (-not $res.ok) { return @{ ok = $false; error = $res.error; count = 0; rows = @() } }
     $rows = $res.data.results | ForEach-Object {
         $p = $_.properties
         @{
@@ -601,32 +520,16 @@ function Get-LogsRecent {
             created_at = $_.created_time
         }
     }
-
-    return @{
-        ok = $true
-        count = @($rows).Count
-        rows = $rows
-    }
+    return @{ ok = $true; count = @($rows).Count; rows = $rows }
 }
 
 function Get-SoakStatus {
     $soakStart = [datetime]"2026-05-12T08:00:00Z"
-
     $now = (Get-Date).ToUniversalTime()
     $h6  = $soakStart.AddHours(6)
     $h18 = $soakStart.AddHours(18)
     $h24 = $soakStart.AddHours(24)
-
-    $next = if ($now -lt $h6) {
-        $h6
-    } elseif ($now -lt $h18) {
-        $h18
-    } elseif ($now -lt $h24) {
-        $h24
-    } else {
-        $null
-    }
-
+    $next = if ($now -lt $h6) { $h6 } elseif ($now -lt $h18) { $h18 } elseif ($now -lt $h24) { $h24 } else { $null }
     return @{
         ok = $true
         phase = if ($now -lt $h24) { "active" } else { "complete_or_extension_needed" }
@@ -642,6 +545,80 @@ function Get-SoakStatus {
             gamma_h24 = "2026-05-13 04:00 AM ET"
         }
         rollback_trigger = "Any P0 or repeated P1 within 30 minutes"
+    }
+}
+
+# ============================================================
+# v0.6.0 Write-capable Automation Center API
+# ============================================================
+function Invoke-CommandsQueue {
+    param([hashtable]$Body)
+    if ([string]::IsNullOrWhiteSpace($NOTION_TOKEN))       { return @{ ok=$false; error='ATOMARCADE_NOTION_TOKEN not set' } }
+    if ([string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)) { return @{ ok=$false; error='ATOMARCADE_NOTION_DB_ID not set' } }
+    if ($null -eq $Body) { $Body = @{} }
+
+    $command = [string]$Body.command
+    if ([string]::IsNullOrWhiteSpace($command)) { return @{ ok=$false; error='missing command' } }
+
+    $kind     = if ($Body.kind)     { [string]$Body.kind }     else { 'diagnostic' }
+    $risk     = if ($Body.risk)     { [string]$Body.risk }     else { 'low' }
+    $argsText = if ($Body.args)     { [string]$Body.args }     else { '' }
+    $notes    = if ($Body.notes)    { [string]$Body.notes }    else { 'queued via Home Base dashboard' }
+
+    if (-not $CURATOR_POLICY.ContainsKey($kind)) {
+        return @{ ok=$false; blocked=$true; reason="Curator: unknown kind '$kind'" }
+    }
+    if (-not $CURATOR_POLICY[$kind]) {
+        return @{ ok=$false; blocked=$true; reason="Curator: kind '$kind' is disabled" }
+    }
+    if ($risk -eq 'high' -and -not $ALLOW_HIGH_RISK) {
+        return @{ ok=$false; blocked=$true; reason='Curator: risk=high blocked. Set ATOMARCADE_ALLOW_HIGH_RISK=1 to permit.' }
+    }
+
+    $props = @{
+        Command = @{ title     = @(@{ text = @{ content = $command } }) }
+        Status  = @{ select    = @{ name = 'Pending' } }
+        Kind    = @{ select    = @{ name = $kind } }
+        Risk    = @{ select    = @{ name = $risk } }
+        Notes   = @{ rich_text = @(@{ text = @{ content = $notes } }) }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($argsText)) {
+        $props.Args = @{ rich_text = @(@{ text = @{ content = $argsText } }) }
+    }
+    $reqBody = @{ parent = @{ database_id = $NOTION_DATABASE_ID }; properties = $props } | ConvertTo-Json -Depth 10
+    try {
+        $r = Invoke-RestMethod -Uri 'https://api.notion.com/v1/pages' `
+            -Method Post -Headers $script:NotionHeaders -Body $reqBody -TimeoutSec 15
+        Add-LogEntry -Kind 'WRITE_QUEUE' -Message "$kind/$command" -Data @{ page_id=$r.id }
+        return @{ ok=$true; page_id=$r.id; url=$r.url; command=$command; kind=$kind; risk=$risk }
+    } catch {
+        return @{ ok=$false; error=$_.Exception.Message }
+    }
+}
+
+function Invoke-CommandsRetry {
+    param([hashtable]$Body)
+    # Retry = queue a new Pending row with caller-supplied fields from the original row.
+    return Invoke-CommandsQueue -Body $Body
+}
+
+function Invoke-AutomationsToggle {
+    param([hashtable]$Body)
+    if ([string]::IsNullOrWhiteSpace($NOTION_TOKEN)) { return @{ ok=$false; error='ATOMARCADE_NOTION_TOKEN not set' } }
+    if ($null -eq $Body) { $Body = @{} }
+
+    $pageId = [string]$Body.pageId
+    if ([string]::IsNullOrWhiteSpace($pageId)) { return @{ ok=$false; error='missing pageId' } }
+    $enabled = if ($null -ne $Body.enabled) { [bool]$Body.enabled } else { $false }
+
+    $reqBody = @{ properties = @{ Enabled = @{ checkbox = $enabled } } } | ConvertTo-Json -Depth 8
+    try {
+        $r = Invoke-RestMethod -Uri "https://api.notion.com/v1/pages/$pageId" `
+            -Method Patch -Headers $script:NotionHeaders -Body $reqBody -TimeoutSec 15
+        Add-LogEntry -Kind 'WRITE_TOGGLE' -Message "$pageId enabled=$enabled"
+        return @{ ok=$true; page_id=$r.id; enabled=$enabled }
+    } catch {
+        return @{ ok=$false; error=$_.Exception.Message }
     }
 }
 
@@ -664,9 +641,11 @@ $DASHBOARD_HTML = @'
  .ok{color:#7ee787}.bad{color:#f97583}.warn{color:#ffd866}
  button{background:#1f6feb;color:#fff;border:0;padding:6px 12px;border-radius:6px;font-family:inherit;cursor:pointer;margin:2px;font-size:12px}
  button:hover{background:#388bfd}button.danger{background:#a3261b}
+ button.mini{padding:3px 8px;font-size:11px;margin:2px 0 0 0}
  pre{background:#0b0d10;border:1px solid #1f262e;border-radius:6px;padding:10px;font-size:11px;max-height:300px;overflow:auto;margin:0}
  .log-entry{padding:2px 0;border-bottom:1px solid #1f262e}.log-kind{display:inline-block;width:110px;color:#9bb0c5}
- input[type=text]{background:#0b0d10;border:1px solid #1f262e;color:#e6e6e6;padding:6px 8px;border-radius:6px;font-family:inherit;width:60%}
+ input[type=text],select{background:#0b0d10;border:1px solid #1f262e;color:#e6e6e6;padding:6px 8px;border-radius:6px;font-family:inherit;font-size:12px}
+ input[type=text]{width:60%}
  .status-pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;margin-left:6px}
  .pill-ok{background:#123d22;color:#7ee787;border:1px solid #1f6f3a}
  .pill-warn{background:#4a3600;color:#ffd866;border:1px solid #8a6d00}
@@ -678,6 +657,9 @@ $DASHBOARD_HTML = @'
  .card-error{border-color:#8a1f1f}
  .card-warn{border-color:#8a6d00}
  .small-muted{color:#7a8a99;font-size:11px}
+ .queue-form{display:flex;gap:4px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+ .queue-form input[type=text]{flex:1;min-width:120px;width:auto}
+ .queue-form select{font-size:11px}
 </style></head><body>
 <h1>HOME BASE — AUTOMATION CENTER</h1><div class="sub" id="sub">Booting...</div>
 <div class="grid">
@@ -706,6 +688,18 @@ $DASHBOARD_HTML = @'
 
   <div class="card">
     <h2>Command Queue <span id="commands-pill" class="status-pill pill-warn">checking</span></h2>
+    <div class="queue-form">
+      <input id="q-command" type="text" placeholder="Command (e.g. PING)"/>
+      <select id="q-kind">
+        <option>diagnostic</option><option>retroarch</option><option>capture</option><option>observe</option>
+        <option>curator</option><option>system</option><option>git-pull</option><option>notion-log</option>
+      </select>
+      <select id="q-risk">
+        <option>low</option><option>medium</option><option>high</option>
+      </select>
+      <input id="q-args" type="text" placeholder='args JSON (optional)'/>
+      <button onclick="queueNewCommand()">Queue</button>
+    </div>
     <div class="mini-list" id="commands-problem-list"></div>
     <div style="margin-top:12px" class="small-muted">Recent commands</div>
     <div class="mini-list" id="commands-recent-list" style="margin-top:6px"></div>
@@ -725,10 +719,15 @@ $DASHBOARD_HTML = @'
 </div>
 <script>
 async function j(u,o){const r=await fetch(u,o);return r.json()}
+async function apiPost(path,body){try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return await r.json()}catch(e){return {ok:false,error:e.message}}}
 async function cmd(c){await j('/api/retroarch/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:c})});refresh()}
 async function cmdRaw(){const v=document.getElementById('raw-cmd').value.trim();if(!v)return;await cmd(v);document.getElementById('raw-cmd').value=''}
+async function queueNewCommand(){const c=document.getElementById('q-command').value.trim();if(!c){alert('command required');return}const k=document.getElementById('q-kind').value;const risk=document.getElementById('q-risk').value;const a=document.getElementById('q-args').value.trim();const r=await apiPost('/api/commands/queue',{command:c,kind:k,risk:risk,args:a});if(r.ok){document.getElementById('q-command').value='';document.getElementById('q-args').value='';setTimeout(refreshAutomationCenter,400)}else{alert('Queue failed: '+(r.error||r.reason||'unknown'))}}
+async function retryCommand(command,kind,risk){const r=await apiPost('/api/commands/retry',{command:command,kind:kind,risk:risk});if(r.ok){setTimeout(refreshAutomationCenter,400)}else{alert('Retry failed: '+(r.error||r.reason||'unknown'))}}
+async function toggleAutomation(pageId,curEnabled){const r=await apiPost('/api/automations/toggle',{pageId:pageId,enabled:!curEnabled});if(r.ok){setTimeout(refreshAutomationCenter,500)}else{alert('Toggle failed: '+(r.error||'unknown'))}}
 function kv(el,obj){if(!el)return;el.innerHTML='';for(const[k,v]of Object.entries(obj)){const a=document.createElement('div');a.textContent=k;const b=document.createElement('div');if(v===true){b.textContent='yes';b.className='ok'}else if(v===false){b.textContent='no';b.className='bad'}else b.textContent=(v??'-');el.appendChild(a);el.appendChild(b)}}
 function esc(v){if(v===null||v===undefined)return '';return String(v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function jstr(v){return JSON.stringify(v===null||v===undefined?'':String(v))}
 function setPill(id,state,text){const el=document.getElementById(id);if(!el)return;el.className='status-pill '+(state==='ok'?'pill-ok':state==='bad'?'pill-bad':'pill-warn');el.textContent=text}
 function shortText(v,max=90){if(v===null||v===undefined||v==='')return '—';const s=String(v);return s.length>max?s.slice(0,max-1)+'…':s}
 function fmtTime(v){if(!v)return '—';try{return new Date(v).toLocaleString()}catch{return v}}
@@ -773,6 +772,7 @@ async function refreshAutomationCenter(){
         <div class="mini-title">${esc(shortText(r.command))}</div>
         <div class="mini-meta">${esc(r.status)} · ${esc(r.kind||'—')} · ${esc(fmtTime(r.created_at))}</div>
         <div class="mini-meta">${esc(shortText(r.result))}</div>
+        <button class="mini" onclick="retryCommand(${jstr(r.command)},${jstr(r.kind)},${jstr(r.risk)})">Retry</button>
       </div>`);
   }catch(e){setPill('commands-pill','bad','error')}
 
@@ -782,6 +782,7 @@ async function refreshAutomationCenter(){
       <div class="mini-row">
         <div class="mini-title">${esc(shortText(r.command))}</div>
         <div class="mini-meta">${esc(r.status)} · ${esc(r.kind||'—')} · ${esc(r.risk||'—')} · ${esc(fmtTime(r.created_at))}</div>
+        <button class="mini" onclick="retryCommand(${jstr(r.command)},${jstr(r.kind)},${jstr(r.risk)})">Retry</button>
       </div>`);
   }catch(e){renderMiniList('commands-recent-list',[],'Recent commands unavailable.',()=> '')}
 
@@ -796,6 +797,7 @@ async function refreshAutomationCenter(){
         <div class="mini-meta">${esc(r.kind||'—')} · every ${esc(r.interval_sec||'—')}s · run #${esc(r.run_count??'—')}</div>
         <div class="mini-meta">Last: ${esc(fmtTime(r.last_run))}</div>
         <div class="mini-meta">${esc(shortText(r.last_result,120))}</div>
+        <button class="mini" onclick="toggleAutomation(${jstr(r.id)},${r.enabled?'true':'false'})">${r.enabled?'Disable':'Enable'}</button>
       </div>`);
   }catch(e){setPill('autos-pill','bad','error')}
 
@@ -862,19 +864,15 @@ if ($NOTION_ENABLED) {
 }
 Write-Host ""; Write-Host "  Open: http://localhost:$HTTP_PORT/"; Write-Host "  Stop: Ctrl+C"; Write-Host ""
 
-if ($NOTION_ENABLED) {
-    $script:LastNotionPoll = [datetime]::MinValue
-}
+if ($NOTION_ENABLED) { $script:LastNotionPoll = [datetime]::MinValue }
 
 try {
     while ($listener.IsListening) {
-        # Cooperative poll: tick Notion if it's been > NOTION_POLL_SECONDS since last tick.
         if ($NOTION_ENABLED -and ((Get-Date) - $script:LastNotionPoll).TotalSeconds -ge $NOTION_POLL_SECONDS) {
             $script:LastNotionPoll = Get-Date
             Tick-NotionPoller
         }
 
-        # Use BeginGetContext + WaitOne with timeout so we can interleave Notion polling.
         $asyncResult = $listener.BeginGetContext($null, $null)
         $signaled = $asyncResult.AsyncWaitHandle.WaitOne(1000)
         if (-not $signaled) { continue }
@@ -909,13 +907,25 @@ try {
                 }
                 '^GET /api/log$' { Write-Json -Context $ctx -Object $script:Log; break }
 
-                # v0.5 read-only Automation Center endpoints
                 '^GET /api/notion/health$' { Write-Json -Context $ctx -Object (Get-NotionHealth); break }
                 '^GET /api/automations$' { Write-Json -Context $ctx -Object (Get-AutomationsReadOnly); break }
                 '^GET /api/commands/recent$' { Write-Json -Context $ctx -Object (Get-CommandsRecent); break }
                 '^GET /api/commands/problem$' { Write-Json -Context $ctx -Object (Get-CommandsProblem); break }
                 '^GET /api/logs/recent$' { Write-Json -Context $ctx -Object (Get-LogsRecent); break }
                 '^GET /api/soak/status$' { Write-Json -Context $ctx -Object (Get-SoakStatus); break }
+
+                '^POST /api/commands/queue$' {
+                    $body = Read-JsonBody -Context $ctx
+                    Write-Json -Context $ctx -Object (Invoke-CommandsQueue -Body $body); break
+                }
+                '^POST /api/commands/retry$' {
+                    $body = Read-JsonBody -Context $ctx
+                    Write-Json -Context $ctx -Object (Invoke-CommandsRetry -Body $body); break
+                }
+                '^POST /api/automations/toggle$' {
+                    $body = Read-JsonBody -Context $ctx
+                    Write-Json -Context $ctx -Object (Invoke-AutomationsToggle -Body $body); break
+                }
 
                 '^POST /api/retroarch/command$' {
                     $body = Read-JsonBody -Context $ctx
