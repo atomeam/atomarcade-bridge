@@ -1,4 +1,4 @@
-# AtomArcade Home Base — v0.5
+# AtomArcade Home Base — v0.5.2
 # Single-file PowerShell HTTP server + Notion Command Bus + Read-only Automation Center.
 # Run with: pwsh -File homebase.ps1
 # Requires: PowerShell 7+, Windows, RetroArch with network_cmd_enable = "true".
@@ -13,7 +13,7 @@ $RETROARCH_HOST  = '127.0.0.1'
 $RETROARCH_PORT  = 55355
 $UDP_TIMEOUT_MS  = 800
 $LOG_MAX         = 500
-$VERSION         = 'v0.5-readonly-automation-center'
+$VERSION         = 'v0.5.2-remote-ops'
 
 # --- Notion Command Bus ---
 # Set these as machine/user env vars so the token never lives in the script file.
@@ -36,6 +36,8 @@ $CURATOR_POLICY = @{
     'shell-safe'  = $false   # opt-in: flip to $true after you allowlist commands below
     'curator'     = $true
     'system'      = $true
+    'git-pull'    = $true    # v0.5.2: ff-only pull from origin/main
+    'notion-log'  = $true    # v0.5.2: write a row to the Logs DB
 }
 $ALLOW_HIGH_RISK = ($env:ATOMARCADE_ALLOW_HIGH_RISK -eq '1')
 
@@ -47,6 +49,9 @@ $SHELL_SAFE_ALLOWLIST = @(
     'Get-Date',
     'Get-Process retroarch'
 )
+
+# --- Remote-ops paths (v0.5.2) ---
+$REPO_ROOT = $PSScriptRoot
 
 # ============================================================
 # In-memory state
@@ -91,6 +96,92 @@ function Send-RetroArchCommand {
         return @{ ok = $false; error = $_.Exception.Message }
     } finally {
         $udp.Close()
+    }
+}
+
+# ============================================================
+# v0.5.2 Remote-ops helpers
+# ============================================================
+function Invoke-GitPull {
+    if ([string]::IsNullOrWhiteSpace($REPO_ROOT)) {
+        return @{ ok=$false; error='REPO_ROOT not set' }
+    }
+    if (-not (Test-Path (Join-Path $REPO_ROOT '.git'))) {
+        return @{ ok=$false; error="not a git repo: $REPO_ROOT" }
+    }
+    try {
+        $before = (& git -C $REPO_ROOT rev-parse HEAD 2>&1) -join ''
+        if ($LASTEXITCODE -ne 0) {
+            return @{ ok=$false; error="rev-parse before failed: $before" }
+        }
+        $pullOutput = (& git -C $REPO_ROOT pull --ff-only origin main 2>&1) -join "`n"
+        $pullExit = $LASTEXITCODE
+        $after = (& git -C $REPO_ROOT rev-parse HEAD 2>&1) -join ''
+        $changed = ($before.Trim() -ne $after.Trim())
+        return @{
+            ok               = ($pullExit -eq 0)
+            changed          = $changed
+            before           = $before.Trim()
+            after            = $after.Trim()
+            pull_exit_code   = $pullExit
+            output           = $pullOutput
+            requires_restart = $changed
+            repo_root        = $REPO_ROOT
+        }
+    } catch {
+        return @{ ok=$false; error=$_.Exception.Message }
+    }
+}
+
+function Invoke-NotionLog {
+    param(
+        [string]$Event,
+        [string]$ArgsJson
+    )
+    if ([string]::IsNullOrWhiteSpace($NOTION_TOKEN)) {
+        return @{ ok=$false; error='ATOMARCADE_NOTION_TOKEN not set' }
+    }
+    if ([string]::IsNullOrWhiteSpace($NOTION_LOG_DB_ID)) {
+        return @{ ok=$false; error='ATOMARCADE_NOTION_LOG_DB_ID not set' }
+    }
+
+    $argsObj = @{}
+    if (-not [string]::IsNullOrWhiteSpace($ArgsJson)) {
+        try { $argsObj = $ArgsJson | ConvertFrom-Json -AsHashtable } catch { $argsObj = @{} }
+    }
+
+    $eventText = if (-not [string]::IsNullOrWhiteSpace($Event)) { $Event } elseif ($argsObj.event) { [string]$argsObj.event } else { 'remote-log' }
+    $level     = if ($argsObj.level)   { [string]$argsObj.level }   else { 'info' }
+    $logKind   = if ($argsObj.kind)    { [string]$argsObj.kind }    else { 'notion-log' }
+    $source    = if ($argsObj.source)  { [string]$argsObj.source }  else { 'home-base' }
+    $payload   = if ($argsObj.payload) { [string]$argsObj.payload } else { '' }
+
+    # Truncate long fields to keep request well under Notion 2000-char rich_text limit.
+    $maxLen = 1900
+    if ($payload.Length -gt $maxLen) { $payload = $payload.Substring(0,$maxLen) + ' ...[truncated]' }
+    if ($eventText.Length -gt 190)   { $eventText = $eventText.Substring(0,190) + '…' }
+
+    $props = @{
+        Event     = @{ title     = @(@{ text = @{ content = $eventText } }) }
+        Level     = @{ select    = @{ name = $level } }
+        Timestamp = @{ date      = @{ start = (Get-Date).ToString('o') } }
+        Kind      = @{ rich_text = @(@{ text = @{ content = $logKind } }) }
+        Source    = @{ rich_text = @(@{ text = @{ content = $source } }) }
+        Executor  = @{ rich_text = @(@{ text = @{ content = "$($script:Hostname) / $VERSION" } }) }
+        Payload   = @{ rich_text = @(@{ text = @{ content = $payload } }) }
+    }
+
+    $body = @{
+        parent     = @{ database_id = $NOTION_LOG_DB_ID }
+        properties = $props
+    } | ConvertTo-Json -Depth 10
+
+    try {
+        $r = Invoke-RestMethod -Uri 'https://api.notion.com/v1/pages' `
+            -Method Post -Headers $script:NotionHeaders -Body $body -TimeoutSec 15
+        return @{ ok=$true; page_id=$r.id; event=$eventText; level=$level; kind=$logKind; source=$source }
+    } catch {
+        return @{ ok=$false; error=$_.Exception.Message }
     }
 }
 
@@ -165,6 +256,14 @@ function Invoke-BridgeCommand {
                 'LOG_COUNT'   { return @{ ok=$true; count=$script:Log.Count } }
                 default       { return @{ ok=$false; error="unknown system command: $Command" } }
             }
+        }
+        'git-pull'    {
+            Add-LogEntry -Kind 'GIT_PULL' -Message "requested via $Command"
+            return Invoke-GitPull
+        }
+        'notion-log'  {
+            Add-LogEntry -Kind 'NOTION_LOG' -Message "event=$Command"
+            return Invoke-NotionLog -Event $Command -ArgsJson $ArgsJson
         }
         default { return @{ ok=$false; error="unknown kind: $Kind" } }
     }
