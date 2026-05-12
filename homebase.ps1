@@ -1,4 +1,4 @@
-# AtomArcade Home Base — v0.6.0
+# AtomArcade Home Base — v0.6.1
 # Single-file PowerShell HTTP server + Notion Command Bus + write-capable Automation Center.
 # Run with: pwsh -File homebase.ps1
 # Requires: PowerShell 7+, Windows, RetroArch with network_cmd_enable = "true".
@@ -13,7 +13,7 @@ $RETROARCH_HOST  = '127.0.0.1'
 $RETROARCH_PORT  = 55355
 $UDP_TIMEOUT_MS  = 800
 $LOG_MAX         = 500
-$VERSION         = 'v0.6.0-write-actions'
+$VERSION         = 'v0.6.1-write-log'
 
 # --- Notion Command Bus ---
 $NOTION_TOKEN          = $env:ATOMARCADE_NOTION_TOKEN
@@ -48,6 +48,24 @@ $SHELL_SAFE_ALLOWLIST = @(
 
 # --- Remote-ops paths ---
 $REPO_ROOT = $PSScriptRoot
+
+# ============================================================
+# Local file logger (v0.6.1)
+# Tiny single-pass helper: timestamped append to homebase.log in script folder.
+# Fails silently so logging never breaks the main script.
+# DO NOT pass secrets or tokens.
+# ============================================================
+function Write-Log {
+    param([string]$Message)
+    try {
+        $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+        $logFile   = Join-Path $scriptDir 'homebase.log'
+        $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+        "$timestamp `t $Message" | Out-File -FilePath $logFile -Encoding UTF8 -Append -ErrorAction Stop
+    } catch {
+        # Fail silently so logging never breaks the main script.
+    }
+}
 
 # ============================================================
 # In-memory state
@@ -857,6 +875,7 @@ try { $listener.Start() } catch {
     throw
 }
 Add-LogEntry -Kind 'BOOT' -Message "Home Base $VERSION listening on http://localhost:$HTTP_PORT/"
+Write-Log "BOOT homebase.ps1 $VERSION started by $env:USERNAME on $($script:Hostname) listening on http://localhost:$HTTP_PORT/"
 if ($NOTION_ENABLED) {
     Add-LogEntry -Kind 'BOOT' -Message "Notion Command Bus enabled (poll every ${NOTION_POLL_SECONDS}s)"
 } else {
@@ -955,4 +974,5 @@ try {
 } finally {
     $listener.Stop(); $listener.Close()
     Add-LogEntry -Kind 'SHUTDOWN' -Message 'Home Base stopped'
+    Write-Log "SHUTDOWN homebase.ps1 $VERSION stopped"
 }
