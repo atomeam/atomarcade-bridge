@@ -1,4 +1,4 @@
-# AtomArcade Home Base — v0.6.1
+# AtomArcade Home Base — v0.6.2
 # Single-file PowerShell HTTP server + Notion Command Bus + write-capable Automation Center.
 # Run with: pwsh -File homebase.ps1
 # Requires: PowerShell 7+, Windows, RetroArch with network_cmd_enable = "true".
@@ -13,7 +13,8 @@ $RETROARCH_HOST  = '127.0.0.1'
 $RETROARCH_PORT  = 55355
 $UDP_TIMEOUT_MS  = 800
 $LOG_MAX         = 500
-$VERSION         = 'v0.6.1-write-log'
+$VERSION         = 'v0.6.2-chorus-hardening'
+$GOVERNANCE_HASH = 'curator-policy-v0.6'
 
 # --- Notion Command Bus ---
 $NOTION_TOKEN          = $env:ATOMARCADE_NOTION_TOKEN
@@ -68,11 +69,68 @@ function Write-Log {
 }
 
 # ============================================================
+# Local JSONL log (v0.6.2 — chorus-driven local-first source of truth)
+# DeepSeek + Gemini convergence: write structured event rows to a local
+# append-only JSONL file. This is the durable source of truth; Notion is
+# the human-readable mirror. Migration off Notion later becomes a non-event.
+# Schema follows Gemini's "Chain of Intent":
+#   ts, event, level, kind, origin, author_id, governance_hash,
+#   command, status, result, payload
+# Fails silently. NEVER pass tokens or secrets.
+# ============================================================
+function Write-LocalJsonLog {
+    param(
+        [string]$Event,
+        [string]$Level     = 'info',
+        [string]$Kind      = '',
+        [string]$Origin    = 'bridge',
+        [string]$AuthorId  = '',
+        [string]$Command   = '',
+        [string]$Status    = '',
+        [string]$Result    = '',
+        [string]$Payload   = ''
+    )
+    try {
+        $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+        $logFile   = Join-Path $scriptDir 'homebase-logs.jsonl'
+        if ([string]::IsNullOrWhiteSpace($AuthorId)) {
+            $AuthorId = "homebase/$VERSION@$($script:Hostname)"
+        }
+        $row = [ordered]@{
+            ts               = (Get-Date).ToString('o')
+            event            = $Event
+            level            = $Level
+            kind             = $Kind
+            origin           = $Origin
+            author_id        = $AuthorId
+            governance_hash  = $GOVERNANCE_HASH
+            command          = $Command
+            status           = $Status
+            result           = $Result
+            payload          = $Payload
+        }
+        $line = ($row | ConvertTo-Json -Compress -Depth 6)
+        $line | Out-File -FilePath $logFile -Encoding UTF8 -Append -ErrorAction Stop
+    } catch {
+        # Fail silently.
+    }
+}
+
+# ============================================================
 # In-memory state
 # ============================================================
 $script:Log     = [System.Collections.Generic.List[object]]::new()
 $script:Started = Get-Date
 $script:Hostname = $env:COMPUTERNAME
+$script:Metrics = @{
+    requests_total       = 0
+    requests_errors      = 0
+    writes_by_origin     = @{ cockpit=0; 'notion-direct'=0; automation=0; external=0; unknown=0 }
+    last_request_ms      = 0
+    queue_writes_total   = 0
+    retry_writes_total   = 0
+    toggle_writes_total  = 0
+}
 
 function Add-LogEntry {
     param([string]$Kind, [string]$Message, [object]$Data = $null)
@@ -192,8 +250,10 @@ function Invoke-NotionLog {
     try {
         $r = Invoke-RestMethod -Uri 'https://api.notion.com/v1/pages' `
             -Method Post -Headers $script:NotionHeaders -Body $body -TimeoutSec 15
+        Write-LocalJsonLog -Event $eventText -Level $level -Kind $logKind -Origin 'notion-log' -Command 'notion-log' -Status 'ok' -Result $r.id -Payload $payload
         return @{ ok=$true; page_id=$r.id; event=$eventText; level=$level; kind=$logKind; source=$source }
     } catch {
+        Write-LocalJsonLog -Event $eventText -Level 'error' -Kind $logKind -Origin 'notion-log' -Command 'notion-log' -Status 'fail' -Result $_.Exception.Message -Payload $payload
         return @{ ok=$false; error=$_.Exception.Message }
     }
 }
@@ -258,7 +318,7 @@ function Invoke-BridgeCommand {
         }
         'curator'     {
             switch ($Command) {
-                'POLICY_DUMP' { return @{ ok=$true; policy=$CURATOR_POLICY; allow_high_risk=$ALLOW_HIGH_RISK } }
+                'POLICY_DUMP' { return @{ ok=$true; policy=$CURATOR_POLICY; allow_high_risk=$ALLOW_HIGH_RISK; governance_hash=$GOVERNANCE_HASH } }
                 default       { return @{ ok=$false; error="unknown curator command: $Command" } }
             }
         }
@@ -344,6 +404,7 @@ function Tick-NotionPoller {
 
             if ([string]::IsNullOrWhiteSpace($command)) {
                 Update-CommandRow -PageId $pageId -Status 'Failed' -Result 'empty Command' -SetExecutedAt
+                Write-LocalJsonLog -Event 'notion-poll-empty-cmd' -Level 'warn' -Kind 'poller' -Origin 'notion-direct' -Command '' -Status 'fail' -Result 'empty Command'
                 continue
             }
             if ([string]::IsNullOrWhiteSpace($kind)) { $kind = 'retroarch' }
@@ -357,18 +418,23 @@ function Tick-NotionPoller {
                 $json = $result | ConvertTo-Json -Depth 6 -Compress
                 if ($result.blocked) {
                     Update-CommandRow -PageId $pageId -Status 'Blocked' -Result $json -SetExecutedAt
+                    Write-LocalJsonLog -Event 'notion-cmd' -Level 'warn' -Kind $kind -Origin 'notion-direct' -Command $command -Status 'blocked' -Result $json
                 } elseif ($result.ok) {
                     Update-CommandRow -PageId $pageId -Status 'Completed' -Result $json -SetExecutedAt
+                    Write-LocalJsonLog -Event 'notion-cmd' -Level 'info' -Kind $kind -Origin 'notion-direct' -Command $command -Status 'ok' -Result $json
                 } else {
                     Update-CommandRow -PageId $pageId -Status 'Failed' -Result $json -SetExecutedAt
+                    Write-LocalJsonLog -Event 'notion-cmd' -Level 'error' -Kind $kind -Origin 'notion-direct' -Command $command -Status 'fail' -Result $json
                 }
             } catch {
                 Update-CommandRow -PageId $pageId -Status 'Failed' -Result $_.Exception.Message -SetExecutedAt
                 Add-LogEntry -Kind 'ERROR' -Message $_.Exception.Message
+                Write-LocalJsonLog -Event 'notion-cmd' -Level 'error' -Kind $kind -Origin 'notion-direct' -Command $command -Status 'exception' -Result $_.Exception.Message
             }
         }
     } catch {
         Add-LogEntry -Kind 'NOTION_ERR' -Message $_.Exception.Message
+        Write-LocalJsonLog -Event 'notion-poller-error' -Level 'error' -Kind 'poller' -Origin 'bridge' -Status 'fail' -Result $_.Exception.Message
     }
 }
 
@@ -567,7 +633,48 @@ function Get-SoakStatus {
 }
 
 # ============================================================
+# Four Golden Signals snapshot (Gemini SRE/SPOG)
+# Approximate latency / traffic / errors / saturation from
+# in-process counters. Cheap, always available, no extra DB calls.
+# ============================================================
+function Get-HealthSnapshot {
+    $proc = Get-Process -Id $PID
+    $uptimeSec = [int]((Get-Date) - $script:Started).TotalSeconds
+    $traffic   = if ($uptimeSec -gt 0) { [math]::Round($script:Metrics.requests_total / [math]::Max($uptimeSec,1), 4) } else { 0 }
+    $errRate   = if ($script:Metrics.requests_total -gt 0) {
+        [math]::Round($script:Metrics.requests_errors / $script:Metrics.requests_total, 4)
+    } else { 0 }
+    $jsonlPath = Join-Path $REPO_ROOT 'homebase-logs.jsonl'
+    $jsonlBytes = if (Test-Path $jsonlPath) { (Get-Item $jsonlPath).Length } else { 0 }
+    return @{
+        ok               = $true
+        checked_at       = (Get-Date).ToString('o')
+        version          = $VERSION
+        governance_hash  = $GOVERNANCE_HASH
+        golden_signals   = @{
+            latency_last_ms = $script:Metrics.last_request_ms
+            traffic_rps     = $traffic
+            error_rate      = $errRate
+            saturation = @{
+                working_set_mb = [math]::Round($proc.WorkingSet64 / 1MB, 1)
+                cpu_seconds    = [math]::Round($proc.TotalProcessorTime.TotalSeconds, 1)
+                uptime_seconds = $uptimeSec
+                log_in_memory  = $script:Log.Count
+            }
+        }
+        writes_by_origin = $script:Metrics.writes_by_origin
+        write_totals     = @{
+            queue  = $script:Metrics.queue_writes_total
+            retry  = $script:Metrics.retry_writes_total
+            toggle = $script:Metrics.toggle_writes_total
+        }
+        local_jsonl      = @{ path = $jsonlPath; bytes = $jsonlBytes; exists = (Test-Path $jsonlPath) }
+    }
+}
+
+# ============================================================
 # v0.6.0 Write-capable Automation Center API
+# v0.6.2: + origin tag + local JSONL mirror + provenance fields
 # ============================================================
 function Invoke-CommandsQueue {
     param([hashtable]$Body)
@@ -582,23 +689,31 @@ function Invoke-CommandsQueue {
     $risk     = if ($Body.risk)     { [string]$Body.risk }     else { 'low' }
     $argsText = if ($Body.args)     { [string]$Body.args }     else { '' }
     $notes    = if ($Body.notes)    { [string]$Body.notes }    else { 'queued via Home Base dashboard' }
+    $origin   = if ($Body.origin)   { [string]$Body.origin }   else { 'cockpit' }
+    $trigger  = if ($Body.trigger)  { [string]$Body.trigger }  else { 'user_explicit_invocation' }
 
     if (-not $CURATOR_POLICY.ContainsKey($kind)) {
+        Write-LocalJsonLog -Event 'queue-blocked' -Level 'warn' -Kind $kind -Origin $origin -Command $command -Status 'blocked' -Result "unknown kind '$kind'"
         return @{ ok=$false; blocked=$true; reason="Curator: unknown kind '$kind'" }
     }
     if (-not $CURATOR_POLICY[$kind]) {
+        Write-LocalJsonLog -Event 'queue-blocked' -Level 'warn' -Kind $kind -Origin $origin -Command $command -Status 'blocked' -Result "kind '$kind' disabled"
         return @{ ok=$false; blocked=$true; reason="Curator: kind '$kind' is disabled" }
     }
     if ($risk -eq 'high' -and -not $ALLOW_HIGH_RISK) {
+        Write-LocalJsonLog -Event 'queue-blocked' -Level 'warn' -Kind $kind -Origin $origin -Command $command -Status 'blocked' -Result 'risk=high blocked'
         return @{ ok=$false; blocked=$true; reason='Curator: risk=high blocked. Set ATOMARCADE_ALLOW_HIGH_RISK=1 to permit.' }
     }
+
+    # Embed origin + trigger into Notes so day-30 KPI is recoverable from Notion mirror without schema changes.
+    $notesWithProvenance = "$notes | origin=$origin | trigger=$trigger | gov=$GOVERNANCE_HASH"
 
     $props = @{
         Command = @{ title     = @(@{ text = @{ content = $command } }) }
         Status  = @{ select    = @{ name = 'Pending' } }
         Kind    = @{ select    = @{ name = $kind } }
         Risk    = @{ select    = @{ name = $risk } }
-        Notes   = @{ rich_text = @(@{ text = @{ content = $notes } }) }
+        Notes   = @{ rich_text = @(@{ text = @{ content = $notesWithProvenance } }) }
     }
     if (-not [string]::IsNullOrWhiteSpace($argsText)) {
         $props.Args = @{ rich_text = @(@{ text = @{ content = $argsText } }) }
@@ -607,16 +722,23 @@ function Invoke-CommandsQueue {
     try {
         $r = Invoke-RestMethod -Uri 'https://api.notion.com/v1/pages' `
             -Method Post -Headers $script:NotionHeaders -Body $reqBody -TimeoutSec 15
-        Add-LogEntry -Kind 'WRITE_QUEUE' -Message "$kind/$command" -Data @{ page_id=$r.id }
-        return @{ ok=$true; page_id=$r.id; url=$r.url; command=$command; kind=$kind; risk=$risk }
+        Add-LogEntry -Kind 'WRITE_QUEUE' -Message "$kind/$command [$origin]" -Data @{ page_id=$r.id; origin=$origin }
+        $script:Metrics.queue_writes_total++
+        if ($script:Metrics.writes_by_origin.ContainsKey($origin)) { $script:Metrics.writes_by_origin[$origin]++ } else { $script:Metrics.writes_by_origin['unknown']++ }
+        Write-LocalJsonLog -Event 'queue' -Level 'info' -Kind $kind -Origin $origin -Command $command -Status 'ok' -Result $r.id -Payload $argsText
+        return @{ ok=$true; page_id=$r.id; url=$r.url; command=$command; kind=$kind; risk=$risk; origin=$origin; trigger=$trigger }
     } catch {
+        Write-LocalJsonLog -Event 'queue' -Level 'error' -Kind $kind -Origin $origin -Command $command -Status 'fail' -Result $_.Exception.Message -Payload $argsText
         return @{ ok=$false; error=$_.Exception.Message }
     }
 }
 
 function Invoke-CommandsRetry {
     param([hashtable]$Body)
-    # Retry = queue a new Pending row with caller-supplied fields from the original row.
+    if ($null -eq $Body) { $Body = @{} }
+    if (-not $Body.origin)  { $Body.origin  = 'cockpit' }
+    if (-not $Body.trigger) { $Body.trigger = 'user_explicit_retry' }
+    $script:Metrics.retry_writes_total++
     return Invoke-CommandsQueue -Body $Body
 }
 
@@ -628,17 +750,58 @@ function Invoke-AutomationsToggle {
     $pageId = [string]$Body.pageId
     if ([string]::IsNullOrWhiteSpace($pageId)) { return @{ ok=$false; error='missing pageId' } }
     $enabled = if ($null -ne $Body.enabled) { [bool]$Body.enabled } else { $false }
+    $origin  = if ($Body.origin) { [string]$Body.origin } else { 'cockpit' }
 
     $reqBody = @{ properties = @{ Enabled = @{ checkbox = $enabled } } } | ConvertTo-Json -Depth 8
     try {
         $r = Invoke-RestMethod -Uri "https://api.notion.com/v1/pages/$pageId" `
             -Method Patch -Headers $script:NotionHeaders -Body $reqBody -TimeoutSec 15
-        Add-LogEntry -Kind 'WRITE_TOGGLE' -Message "$pageId enabled=$enabled"
-        return @{ ok=$true; page_id=$r.id; enabled=$enabled }
+        Add-LogEntry -Kind 'WRITE_TOGGLE' -Message "$pageId enabled=$enabled [$origin]"
+        $script:Metrics.toggle_writes_total++
+        if ($script:Metrics.writes_by_origin.ContainsKey($origin)) { $script:Metrics.writes_by_origin[$origin]++ }
+        Write-LocalJsonLog -Event 'toggle' -Level 'info' -Kind 'automation' -Origin $origin -Command "toggle/$pageId" -Status 'ok' -Result "enabled=$enabled"
+        return @{ ok=$true; page_id=$r.id; enabled=$enabled; origin=$origin }
     } catch {
+        Write-LocalJsonLog -Event 'toggle' -Level 'error' -Kind 'automation' -Origin $origin -Command "toggle/$pageId" -Status 'fail' -Result $_.Exception.Message
         return @{ ok=$false; error=$_.Exception.Message }
     }
 }
+
+# ============================================================
+# PWA manifest + service worker stub (v0.6.2 — Copilot's canonical fix)
+# Serves a Web App Manifest so Edge offers "Install as App." Service worker
+# is intentionally minimal — just enough for Edge to treat the site as
+# installable. No offline cache (cockpit must always reflect live state).
+# ============================================================
+function Get-PwaManifest {
+    return @{
+        name              = 'AtomArcade Home Base'
+        short_name        = 'Home Base'
+        description       = 'AtomArcade cockpit / automation center'
+        start_url         = '/'
+        display           = 'standalone'
+        background_color  = '#0b0d10'
+        theme_color       = '#0b0d10'
+        scope             = '/'
+        orientation       = 'any'
+        icons             = @(
+            @{ src='/icon.svg'; sizes='any'; type='image/svg+xml'; purpose='any' }
+        )
+    } | ConvertTo-Json -Depth 6
+}
+
+$SERVICE_WORKER_JS = @'
+// Home Base service worker (v0.6.2) — minimal, no cache.
+// Required for Edge "Install as App." Intentionally does NOT cache responses
+// so the cockpit always reflects live bridge state.
+self.addEventListener("install", (e) => { self.skipWaiting(); });
+self.addEventListener("activate", (e) => { self.clients.claim(); });
+self.addEventListener("fetch", () => { /* network only */ });
+'@
+
+$ICON_SVG = @'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="64" fill="#0b0d10"/><circle cx="256" cy="256" r="168" fill="none" stroke="#1f6feb" stroke-width="24"/><circle cx="256" cy="256" r="72" fill="#1f6feb"/><circle cx="256" cy="256" r="24" fill="#0b0d10"/></svg>
+'@
 
 # ============================================================
 # HTML dashboard
@@ -646,6 +809,9 @@ function Invoke-AutomationsToggle {
 $DASHBOARD_HTML = @'
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"/><title>AtomArcade Home Base</title>
+<link rel="manifest" href="/manifest.webmanifest"/>
+<meta name="theme-color" content="#0b0d10"/>
+<link rel="icon" type="image/svg+xml" href="/icon.svg"/>
 <style>
  :root{color-scheme:dark}
  body{font-family:ui-monospace,Menlo,Consolas,monospace;background:#0b0d10;color:#e6e6e6;margin:0;padding:24px}
@@ -700,8 +866,19 @@ $DASHBOARD_HTML = @'
   </div>
 
   <div class="card">
+    <h2>Golden Signals <span id="golden-pill" class="status-pill pill-warn">checking</span></h2>
+    <div class="kv" id="golden-kv"></div>
+  </div>
+
+  <div class="card">
     <h2>Soak Window <span id="soak-pill" class="status-pill pill-warn">checking</span></h2>
     <div class="kv" id="soak-kv"></div>
+  </div>
+
+  <div class="card">
+    <h2>Day-30 KPI <span id="kpi-pill" class="status-pill pill-warn">checking</span></h2>
+    <div class="kv" id="kpi-kv"></div>
+    <div class="small-muted" style="margin-top:6px">Target: cockpit-originated writes ≥ 70% of total. (DeepSeek day-30 gate.)</div>
   </div>
 
   <div class="card">
@@ -736,13 +913,14 @@ $DASHBOARD_HTML = @'
   <div class="card" style="grid-column:span 2"><h2>Event log</h2><pre id="log"></pre></div>
 </div>
 <script>
+if ('serviceWorker' in navigator) { navigator.serviceWorker.register('/sw.js').catch(()=>{}); }
 async function j(u,o){const r=await fetch(u,o);return r.json()}
 async function apiPost(path,body){try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});return await r.json()}catch(e){return {ok:false,error:e.message}}}
 async function cmd(c){await j('/api/retroarch/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:c})});refresh()}
 async function cmdRaw(){const v=document.getElementById('raw-cmd').value.trim();if(!v)return;await cmd(v);document.getElementById('raw-cmd').value=''}
-async function queueNewCommand(){const c=document.getElementById('q-command').value.trim();if(!c){alert('command required');return}const k=document.getElementById('q-kind').value;const risk=document.getElementById('q-risk').value;const a=document.getElementById('q-args').value.trim();const r=await apiPost('/api/commands/queue',{command:c,kind:k,risk:risk,args:a});if(r.ok){document.getElementById('q-command').value='';document.getElementById('q-args').value='';setTimeout(refreshAutomationCenter,400)}else{alert('Queue failed: '+(r.error||r.reason||'unknown'))}}
-async function retryCommand(command,kind,risk){const r=await apiPost('/api/commands/retry',{command:command,kind:kind,risk:risk});if(r.ok){setTimeout(refreshAutomationCenter,400)}else{alert('Retry failed: '+(r.error||r.reason||'unknown'))}}
-async function toggleAutomation(pageId,curEnabled){const r=await apiPost('/api/automations/toggle',{pageId:pageId,enabled:!curEnabled});if(r.ok){setTimeout(refreshAutomationCenter,500)}else{alert('Toggle failed: '+(r.error||'unknown'))}}
+async function queueNewCommand(){const c=document.getElementById('q-command').value.trim();if(!c){alert('command required');return}const k=document.getElementById('q-kind').value;const risk=document.getElementById('q-risk').value;const a=document.getElementById('q-args').value.trim();const r=await apiPost('/api/commands/queue',{command:c,kind:k,risk:risk,args:a,origin:'cockpit',trigger:'user_explicit_invocation'});if(r.ok){document.getElementById('q-command').value='';document.getElementById('q-args').value='';setTimeout(refreshAutomationCenter,400)}else{alert('Queue failed: '+(r.error||r.reason||'unknown'))}}
+async function retryCommand(command,kind,risk){const r=await apiPost('/api/commands/retry',{command:command,kind:kind,risk:risk,origin:'cockpit',trigger:'user_explicit_retry'});if(r.ok){setTimeout(refreshAutomationCenter,400)}else{alert('Retry failed: '+(r.error||r.reason||'unknown'))}}
+async function toggleAutomation(pageId,curEnabled){const r=await apiPost('/api/automations/toggle',{pageId:pageId,enabled:!curEnabled,origin:'cockpit'});if(r.ok){setTimeout(refreshAutomationCenter,500)}else{alert('Toggle failed: '+(r.error||'unknown'))}}
 function kv(el,obj){if(!el)return;el.innerHTML='';for(const[k,v]of Object.entries(obj)){const a=document.createElement('div');a.textContent=k;const b=document.createElement('div');if(v===true){b.textContent='yes';b.className='ok'}else if(v===false){b.textContent='no';b.className='bad'}else b.textContent=(v??'-');el.appendChild(a);el.appendChild(b)}}
 function esc(v){if(v===null||v===undefined)return '';return String(v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function jstr(v){return JSON.stringify(v===null||v===undefined?'':String(v))}
@@ -766,6 +944,34 @@ async function refreshAutomationCenter(){
       'Checked':fmtTime(health.checked_at)
     });
   }catch(e){setPill('notion-pill','bad','error')}
+
+  try{
+    const snap=await j('/api/health/snapshot');
+    const gs=snap.golden_signals||{};
+    const errPct=Math.round((gs.error_rate||0)*1000)/10;
+    setPill('golden-pill',errPct>5?'bad':errPct>1?'warn':'ok',errPct+'% err');
+    kv(document.getElementById('golden-kv'),{
+      'Latency (last)':(gs.latency_last_ms||0)+' ms',
+      'Traffic':(gs.traffic_rps||0)+' req/s',
+      'Error rate':errPct+'%',
+      'Memory':((gs.saturation||{}).working_set_mb||0)+' MB',
+      'CPU sec':(gs.saturation||{}).cpu_seconds||0,
+      'JSONL bytes':(snap.local_jsonl||{}).bytes||0
+    });
+    const wbo=snap.writes_by_origin||{};
+    const total=Object.values(wbo).reduce((a,b)=>a+(b||0),0);
+    const cockpit=wbo.cockpit||0;
+    const pct=total>0?Math.round((cockpit/total)*1000)/10:0;
+    setPill('kpi-pill',pct>=70?'ok':pct>=30?'warn':'bad',pct+'%');
+    kv(document.getElementById('kpi-kv'),{
+      'Cockpit writes':cockpit,
+      'Notion-direct':wbo['notion-direct']||0,
+      'Automation':wbo.automation||0,
+      'Other':(wbo.external||0)+(wbo.unknown||0),
+      'Total writes':total,
+      'Cockpit %':pct+'%'
+    });
+  }catch(e){setPill('golden-pill','bad','error');setPill('kpi-pill','bad','error')}
 
   try{
     const soak=await j('/api/soak/status');
@@ -861,6 +1067,14 @@ function Write-Html { param($Context, [string]$Html)
     $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
     $Context.Response.OutputStream.Close()
 }
+function Write-Text { param($Context, [string]$Text, [string]$ContentType = 'text/plain; charset=utf-8', [int]$Status = 200)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $Context.Response.StatusCode = $Status
+    $Context.Response.ContentType = $ContentType
+    $Context.Response.ContentLength64 = $bytes.Length
+    $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+    $Context.Response.OutputStream.Close()
+}
 function Read-JsonBody { param($Context)
     $reader = [System.IO.StreamReader]::new($Context.Request.InputStream, $Context.Request.ContentEncoding)
     $body = $reader.ReadToEnd(); $reader.Close()
@@ -876,6 +1090,7 @@ try { $listener.Start() } catch {
 }
 Add-LogEntry -Kind 'BOOT' -Message "Home Base $VERSION listening on http://localhost:$HTTP_PORT/"
 Write-Log "BOOT homebase.ps1 $VERSION started by $env:USERNAME on $($script:Hostname) listening on http://localhost:$HTTP_PORT/"
+Write-LocalJsonLog -Event 'boot' -Level 'info' -Kind 'lifecycle' -Origin 'bridge' -Status 'ok' -Result "$VERSION listening on http://localhost:$HTTP_PORT/"
 if ($NOTION_ENABLED) {
     Add-LogEntry -Kind 'BOOT' -Message "Notion Command Bus enabled (poll every ${NOTION_POLL_SECONDS}s)"
 } else {
@@ -898,9 +1113,14 @@ try {
         $ctx = $listener.EndGetContext($asyncResult)
 
         $req = $ctx.Request; $path = $req.Url.AbsolutePath; $method = $req.HttpMethod
+        $reqStart = Get-Date
+        $script:Metrics.requests_total++
         try {
             switch -Regex ("$method $path") {
                 '^GET /$' { Write-Html -Context $ctx -Html $DASHBOARD_HTML; break }
+                '^GET /manifest\.webmanifest$' { Write-Text -Context $ctx -Text (Get-PwaManifest) -ContentType 'application/manifest+json; charset=utf-8'; break }
+                '^GET /sw\.js$' { Write-Text -Context $ctx -Text $SERVICE_WORKER_JS -ContentType 'application/javascript; charset=utf-8'; break }
+                '^GET /icon\.svg$' { Write-Text -Context $ctx -Text $ICON_SVG -ContentType 'image/svg+xml; charset=utf-8'; break }
                 '^GET /api/status$' {
                     $ping = Send-RetroArchCommand -Command 'GET_STATUS'
                     $ra = @{ reachable = $ping.ok; raw = $ping.reply; error = $ping.error }
@@ -911,7 +1131,7 @@ try {
                     $payload = @{
                         bridge = @{
                             ok=$true; version=$VERSION; uptime_seconds=[int]((Get-Date)-$script:Started).TotalSeconds
-                            log_count=$script:Log.Count; hostname=$script:Hostname
+                            log_count=$script:Log.Count; hostname=$script:Hostname; governance_hash=$GOVERNANCE_HASH
                         }
                         retroarch = $ra
                         notion_bus = @{
@@ -927,6 +1147,7 @@ try {
                 '^GET /api/log$' { Write-Json -Context $ctx -Object $script:Log; break }
 
                 '^GET /api/notion/health$' { Write-Json -Context $ctx -Object (Get-NotionHealth); break }
+                '^GET /api/health/snapshot$' { Write-Json -Context $ctx -Object (Get-HealthSnapshot); break }
                 '^GET /api/automations$' { Write-Json -Context $ctx -Object (Get-AutomationsReadOnly); break }
                 '^GET /api/commands/recent$' { Write-Json -Context $ctx -Object (Get-CommandsRecent); break }
                 '^GET /api/commands/problem$' { Write-Json -Context $ctx -Object (Get-CommandsProblem); break }
@@ -964,15 +1185,20 @@ try {
                     Tick-NotionPoller
                     Write-Json -Context $ctx -Object @{ ok=$true; polled_at=(Get-Date).ToString('o') }; break
                 }
-                default { Write-Json -Context $ctx -Status 404 -Object @{ error='not found'; path=$path } }
+                default { $script:Metrics.requests_errors++; Write-Json -Context $ctx -Status 404 -Object @{ error='not found'; path=$path } }
             }
         } catch {
+            $script:Metrics.requests_errors++
             Add-LogEntry -Kind 'ERROR' -Message $_.Exception.Message
+            Write-LocalJsonLog -Event 'http-error' -Level 'error' -Kind 'http' -Origin 'bridge' -Command "$method $path" -Status 'fail' -Result $_.Exception.Message
             try { Write-Json -Context $ctx -Status 500 -Object @{ error = $_.Exception.Message } } catch {}
+        } finally {
+            $script:Metrics.last_request_ms = [int]((Get-Date) - $reqStart).TotalMilliseconds
         }
     }
 } finally {
     $listener.Stop(); $listener.Close()
     Add-LogEntry -Kind 'SHUTDOWN' -Message 'Home Base stopped'
     Write-Log "SHUTDOWN homebase.ps1 $VERSION stopped"
+    Write-LocalJsonLog -Event 'shutdown' -Level 'info' -Kind 'lifecycle' -Origin 'bridge' -Status 'ok' -Result "$VERSION stopped cleanly"
 }
