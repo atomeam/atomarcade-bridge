@@ -1,5 +1,5 @@
-# AtomArcade Home Base — v0.2
-# Single-file PowerShell HTTP server + Notion Command Bus.
+# AtomArcade Home Base — v0.5
+# Single-file PowerShell HTTP server + Notion Command Bus + Read-only Automation Center.
 # Run with: pwsh -File homebase.ps1
 # Requires: PowerShell 7+, Windows, RetroArch with network_cmd_enable = "true".
 
@@ -13,13 +13,14 @@ $RETROARCH_HOST  = '127.0.0.1'
 $RETROARCH_PORT  = 55355
 $UDP_TIMEOUT_MS  = 800
 $LOG_MAX         = 500
-$VERSION         = 'v0.2'
+$VERSION         = 'v0.5-readonly-automation-center'
 
 # --- Notion Command Bus ---
-# Set these as machine env vars (System Properties > Environment Variables) so the token
-# never lives in the script file. Both are read once at boot.
+# Set these as machine/user env vars so the token never lives in the script file.
 $NOTION_TOKEN          = $env:ATOMARCADE_NOTION_TOKEN
 $NOTION_DATABASE_ID    = $env:ATOMARCADE_NOTION_DB_ID
+$NOTION_AUTO_DB_ID     = $env:ATOMARCADE_NOTION_AUTO_DB_ID
+$NOTION_LOG_DB_ID      = $env:ATOMARCADE_NOTION_LOG_DB_ID
 $NOTION_POLL_SECONDS   = 5
 $NOTION_API_VERSION    = '2022-06-28'
 $NOTION_ENABLED        = -not [string]::IsNullOrWhiteSpace($NOTION_TOKEN) -and -not [string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)
@@ -240,7 +241,6 @@ function Tick-NotionPoller {
             Update-CommandRow -PageId $pageId -Status 'Running'
             Add-LogEntry -Kind 'NOTION_CMD' -Message "$kind/$command" -Data @{ risk=$risk; args=$argsRaw }
 
-            $result = $null
             try {
                 $result = Invoke-BridgeCommand -Command $command -Kind $kind -Risk $risk -ArgsJson $argsRaw
                 $json = $result | ConvertTo-Json -Depth 6 -Compress
@@ -258,6 +258,291 @@ function Tick-NotionPoller {
         }
     } catch {
         Add-LogEntry -Kind 'NOTION_ERR' -Message $_.Exception.Message
+    }
+}
+
+# ============================================================
+# Home Base v0.5 — Read-only Automation Center API
+# ============================================================
+function Get-ConfigStatus {
+    return @{
+        token_present          = -not [string]::IsNullOrWhiteSpace($NOTION_TOKEN)
+        commands_db_present    = -not [string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)
+        automations_db_present = -not [string]::IsNullOrWhiteSpace($NOTION_AUTO_DB_ID)
+        logs_db_present        = -not [string]::IsNullOrWhiteSpace($NOTION_LOG_DB_ID)
+    }
+}
+
+function Get-PlainText {
+    param($RichTextArray)
+    if ($null -eq $RichTextArray) { return $null }
+    if ($RichTextArray.Count -eq 0) { return $null }
+    return (($RichTextArray | ForEach-Object { $_.plain_text }) -join "")
+}
+
+function Get-TitleText {
+    param($TitleArray)
+    if ($null -eq $TitleArray) { return $null }
+    if ($TitleArray.Count -eq 0) { return $null }
+    return (($TitleArray | ForEach-Object { $_.plain_text }) -join "")
+}
+
+function Invoke-NotionDatabaseQuery {
+    param(
+        [Parameter(Mandatory)][string]$DatabaseId,
+        [hashtable]$Body = @{}
+    )
+
+    if ([string]::IsNullOrWhiteSpace($NOTION_TOKEN)) {
+        return @{ ok = $false; error = "Missing ATOMARCADE_NOTION_TOKEN" }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($DatabaseId)) {
+        return @{ ok = $false; error = "Missing database id" }
+    }
+
+    $uri = "https://api.notion.com/v1/databases/$DatabaseId/query"
+    $headers = @{
+        "Authorization"  = "Bearer $NOTION_TOKEN"
+        "Notion-Version" = $NOTION_API_VERSION
+        "Content-Type"   = "application/json"
+    }
+
+    if ($Body.Count -eq 0) {
+        $Body = @{ page_size = 20 }
+    }
+
+    try {
+        $json = $Body | ConvertTo-Json -Depth 20
+        $res = Invoke-RestMethod -Method POST -Uri $uri -Headers $headers -Body $json -ErrorAction Stop
+        return @{ ok = $true; data = $res }
+    }
+    catch {
+        return @{
+            ok = $false
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-NotionHealth {
+    $config = Get-ConfigStatus
+
+    $cmd  = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_DATABASE_ID -Body @{ page_size = 1 }
+    $auto = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_AUTO_DB_ID  -Body @{ page_size = 1 }
+    $logs = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_LOG_DB_ID   -Body @{ page_size = 1 }
+
+    return @{
+        ok = ($cmd.ok -and $auto.ok -and $logs.ok)
+        checked_at = (Get-Date).ToString("o")
+        config = $config
+        databases = @{
+            commands = @{ ok = $cmd.ok;  error = $cmd.error }
+            automations = @{ ok = $auto.ok; error = $auto.error }
+            logs = @{ ok = $logs.ok; error = $logs.error }
+        }
+    }
+}
+
+function Get-AutomationsReadOnly {
+    $body = @{
+        page_size = 50
+        sorts = @(
+            @{
+                property = "Last Run"
+                direction = "descending"
+            }
+        )
+    }
+
+    $res = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_AUTO_DB_ID -Body $body
+
+    if (-not $res.ok) {
+        return @{ ok = $false; error = $res.error; count = 0; rows = @() }
+    }
+
+    $rows = $res.data.results | ForEach-Object {
+        $p = $_.properties
+        @{
+            url = $_.url
+            id = $_.id
+            name = Get-TitleText $p.Name.title
+            enabled = $p.Enabled.checkbox
+            kind = $p.Kind.select.name
+            command = Get-PlainText $p.Command.rich_text
+            interval_sec = $p."Interval (sec)".number
+            last_run = $p."Last Run".date.start
+            run_count = $p."Run Count".number
+            last_result = Get-PlainText $p."Last Result".rich_text
+        }
+    }
+
+    return @{
+        ok = $true
+        count = @($rows).Count
+        rows = $rows
+    }
+}
+
+function Get-CommandsRecent {
+    $body = @{
+        page_size = 10
+        sorts = @(
+            @{
+                property = "Created At"
+                direction = "descending"
+            }
+        )
+    }
+
+    $res = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_DATABASE_ID -Body $body
+
+    if (-not $res.ok) {
+        return @{ ok = $false; error = $res.error; count = 0; rows = @() }
+    }
+
+    $rows = $res.data.results | ForEach-Object {
+        $p = $_.properties
+        @{
+            url = $_.url
+            id = $_.id
+            command = Get-TitleText $p.Command.title
+            status = $p.Status.select.name
+            kind = $p.Kind.select.name
+            risk = $p.Risk.select.name
+            result = Get-PlainText $p.Result.rich_text
+            executor = Get-PlainText $p.Executor.rich_text
+            created_at = $p."Created At".created_time
+            executed_at = $p."Executed At".date.start
+        }
+    }
+
+    return @{
+        ok = $true
+        count = @($rows).Count
+        rows = $rows
+    }
+}
+
+function Get-CommandsProblem {
+    $body = @{
+        page_size = 50
+        filter = @{
+            or = @(
+                @{ property = "Status"; select = @{ equals = "Pending" } }
+                @{ property = "Status"; select = @{ equals = "Running" } }
+                @{ property = "Status"; select = @{ equals = "Failed" } }
+                @{ property = "Status"; select = @{ equals = "Blocked" } }
+            )
+        }
+        sorts = @(
+            @{
+                property = "Created At"
+                direction = "descending"
+            }
+        )
+    }
+
+    $res = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_DATABASE_ID -Body $body
+
+    if (-not $res.ok) {
+        return @{ ok = $false; error = $res.error; count = 0; rows = @() }
+    }
+
+    $rows = $res.data.results | ForEach-Object {
+        $p = $_.properties
+        @{
+            url = $_.url
+            id = $_.id
+            command = Get-TitleText $p.Command.title
+            status = $p.Status.select.name
+            kind = $p.Kind.select.name
+            risk = $p.Risk.select.name
+            result = Get-PlainText $p.Result.rich_text
+            created_at = $p."Created At".created_time
+        }
+    }
+
+    return @{
+        ok = $true
+        count = @($rows).Count
+        rows = $rows
+    }
+}
+
+function Get-LogsRecent {
+    $body = @{
+        page_size = 20
+        sorts = @(
+            @{
+                property = "Timestamp"
+                direction = "descending"
+            }
+        )
+    }
+
+    $res = Invoke-NotionDatabaseQuery -DatabaseId $NOTION_LOG_DB_ID -Body $body
+
+    if (-not $res.ok) {
+        return @{ ok = $false; error = $res.error; count = 0; rows = @() }
+    }
+
+    $rows = $res.data.results | ForEach-Object {
+        $p = $_.properties
+        @{
+            url = $_.url
+            id = $_.id
+            event = Get-TitleText $p.Event.title
+            level = $p.Level.select.name
+            timestamp = $p.Timestamp.date.start
+            kind = Get-PlainText $p.Kind.rich_text
+            source = Get-PlainText $p.Source.rich_text
+            executor = Get-PlainText $p.Executor.rich_text
+            payload = Get-PlainText $p.Payload.rich_text
+            created_at = $_.created_time
+        }
+    }
+
+    return @{
+        ok = $true
+        count = @($rows).Count
+        rows = $rows
+    }
+}
+
+function Get-SoakStatus {
+    $soakStart = [datetime]"2026-05-12T08:00:00Z"
+
+    $now = (Get-Date).ToUniversalTime()
+    $h6  = $soakStart.AddHours(6)
+    $h18 = $soakStart.AddHours(18)
+    $h24 = $soakStart.AddHours(24)
+
+    $next = if ($now -lt $h6) {
+        $h6
+    } elseif ($now -lt $h18) {
+        $h18
+    } elseif ($now -lt $h24) {
+        $h24
+    } else {
+        $null
+    }
+
+    return @{
+        ok = $true
+        phase = if ($now -lt $h24) { "active" } else { "complete_or_extension_needed" }
+        soak_start = $soakStart.ToString("o")
+        now = $now.ToString("o")
+        h6 = $h6.ToString("o")
+        h18 = $h18.ToString("o")
+        h24 = $h24.ToString("o")
+        next_checkpoint = if ($next) { $next.ToString("o") } else { $null }
+        checkpoints_et = @{
+            alpha_h6 = "2026-05-12 10:00 AM ET"
+            beta_h18 = "2026-05-12 10:00 PM ET"
+            gamma_h24 = "2026-05-13 04:00 AM ET"
+        }
+        rollback_trigger = "Any P0 or repeated P1 within 30 minutes"
     }
 }
 
@@ -283,8 +568,19 @@ $DASHBOARD_HTML = @'
  pre{background:#0b0d10;border:1px solid #1f262e;border-radius:6px;padding:10px;font-size:11px;max-height:300px;overflow:auto;margin:0}
  .log-entry{padding:2px 0;border-bottom:1px solid #1f262e}.log-kind{display:inline-block;width:110px;color:#9bb0c5}
  input[type=text]{background:#0b0d10;border:1px solid #1f262e;color:#e6e6e6;padding:6px 8px;border-radius:6px;font-family:inherit;width:60%}
+ .status-pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700;margin-left:6px}
+ .pill-ok{background:#123d22;color:#7ee787;border:1px solid #1f6f3a}
+ .pill-warn{background:#4a3600;color:#ffd866;border:1px solid #8a6d00}
+ .pill-bad{background:#4a1111;color:#f97583;border:1px solid #8a1f1f}
+ .mini-list{display:flex;flex-direction:column;gap:6px;font-size:12px}
+ .mini-row{border:1px solid #1f262e;background:#0b0d10;border-radius:6px;padding:8px}
+ .mini-title{color:#e6e6e6;font-weight:700}
+ .mini-meta{color:#7a8a99;margin-top:2px;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}
+ .card-error{border-color:#8a1f1f}
+ .card-warn{border-color:#8a6d00}
+ .small-muted{color:#7a8a99;font-size:11px}
 </style></head><body>
-<h1>HOME BASE</h1><div class="sub" id="sub">Booting...</div>
+<h1>HOME BASE — AUTOMATION CENTER</h1><div class="sub" id="sub">Booting...</div>
 <div class="grid">
   <div class="card"><h2>Bridge status</h2><div class="kv" id="bridge-kv"></div></div>
   <div class="card"><h2>RetroArch</h2><div class="kv" id="ra-kv"></div>
@@ -298,15 +594,131 @@ $DASHBOARD_HTML = @'
     <div style="margin-top:12px"><input id="raw-cmd" type="text" placeholder="raw command"/><button onclick="cmdRaw()">Send</button></div>
   </div>
   <div class="card" style="grid-column:span 2"><h2>Notion Command Bus</h2><div class="kv" id="bus-kv"></div></div>
+
+  <div class="card">
+    <h2>System Pulse <span id="notion-pill" class="status-pill pill-warn">checking</span></h2>
+    <div class="kv" id="notion-health-kv"></div>
+  </div>
+
+  <div class="card">
+    <h2>Soak Window <span id="soak-pill" class="status-pill pill-warn">checking</span></h2>
+    <div class="kv" id="soak-kv"></div>
+  </div>
+
+  <div class="card">
+    <h2>Command Queue <span id="commands-pill" class="status-pill pill-warn">checking</span></h2>
+    <div class="mini-list" id="commands-problem-list"></div>
+    <div style="margin-top:12px" class="small-muted">Recent commands</div>
+    <div class="mini-list" id="commands-recent-list" style="margin-top:6px"></div>
+  </div>
+
+  <div class="card">
+    <h2>Automation Runner <span id="autos-pill" class="status-pill pill-warn">checking</span></h2>
+    <div class="mini-list" id="automations-list"></div>
+  </div>
+
+  <div class="card" style="grid-column: span 2">
+    <h2>Latest Bridge Logs <span id="logs-pill" class="status-pill pill-warn">checking</span></h2>
+    <div class="mini-list" id="logs-list"></div>
+  </div>
+
   <div class="card" style="grid-column:span 2"><h2>Event log</h2><pre id="log"></pre></div>
 </div>
 <script>
 async function j(u,o){const r=await fetch(u,o);return r.json()}
 async function cmd(c){await j('/api/retroarch/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:c})});refresh()}
 async function cmdRaw(){const v=document.getElementById('raw-cmd').value.trim();if(!v)return;await cmd(v);document.getElementById('raw-cmd').value=''}
-function kv(el,obj){el.innerHTML='';for(const[k,v]of Object.entries(obj)){const a=document.createElement('div');a.textContent=k;const b=document.createElement('div');if(v===true){b.textContent='yes';b.className='ok'}else if(v===false){b.textContent='no';b.className='bad'}else b.textContent=(v??'-');el.appendChild(a);el.appendChild(b)}}
-async function refresh(){try{const s=await j('/api/status');document.getElementById('sub').textContent='Uptime: '+s.bridge.uptime_seconds+'s  v'+s.bridge.version+'  '+new Date().toLocaleTimeString();kv(document.getElementById('bridge-kv'),s.bridge);kv(document.getElementById('ra-kv'),s.retroarch);kv(document.getElementById('bus-kv'),s.notion_bus);const log=await j('/api/log');document.getElementById('log').innerHTML=log.slice(-40).reverse().map(e=>`<div class="log-entry"><span class="log-kind">${e.kind}</span>${new Date(e.ts).toLocaleTimeString()} -- ${e.message}</div>`).join('')}catch(e){document.getElementById('sub').textContent='Disconnected: '+e.message}}
-refresh();setInterval(refresh,2000)
+function kv(el,obj){if(!el)return;el.innerHTML='';for(const[k,v]of Object.entries(obj)){const a=document.createElement('div');a.textContent=k;const b=document.createElement('div');if(v===true){b.textContent='yes';b.className='ok'}else if(v===false){b.textContent='no';b.className='bad'}else b.textContent=(v??'-');el.appendChild(a);el.appendChild(b)}}
+function esc(v){if(v===null||v===undefined)return '';return String(v).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function setPill(id,state,text){const el=document.getElementById(id);if(!el)return;el.className='status-pill '+(state==='ok'?'pill-ok':state==='bad'?'pill-bad':'pill-warn');el.textContent=text}
+function shortText(v,max=90){if(v===null||v===undefined||v==='')return '—';const s=String(v);return s.length>max?s.slice(0,max-1)+'…':s}
+function fmtTime(v){if(!v)return '—';try{return new Date(v).toLocaleString()}catch{return v}}
+function renderMiniList(id,rows,emptyText,renderer){const el=document.getElementById(id);if(!el)return;if(!rows||rows.length===0){el.innerHTML=`<div class="mini-row"><span class="small-muted">${esc(emptyText)}</span></div>`;return}el.innerHTML=rows.map(renderer).join('')}
+
+async function refresh(){try{const s=await j('/api/status');document.getElementById('sub').textContent='Uptime: '+s.bridge.uptime_seconds+'s  '+s.bridge.version+'  '+new Date().toLocaleTimeString();kv(document.getElementById('bridge-kv'),s.bridge);kv(document.getElementById('ra-kv'),s.retroarch);kv(document.getElementById('bus-kv'),s.notion_bus);const log=await j('/api/log');document.getElementById('log').innerHTML=log.slice(-40).reverse().map(e=>`<div class="log-entry"><span class="log-kind">${esc(e.kind)}</span>${esc(new Date(e.ts).toLocaleTimeString())} -- ${esc(e.message)}</div>`).join('')}catch(e){document.getElementById('sub').textContent='Disconnected: '+e.message}}
+
+async function refreshAutomationCenter(){
+  try{
+    const health=await j('/api/notion/health');
+    setPill('notion-pill',health.ok?'ok':'bad',health.ok?'healthy':'degraded');
+    kv(document.getElementById('notion-health-kv'),{
+      'Notion':health.ok?'reachable':'unreachable',
+      'Token':health.config?.token_present?'present':'missing',
+      'Commands DB':health.databases?.commands?.ok?'ok':'fail',
+      'Automations DB':health.databases?.automations?.ok?'ok':'fail',
+      'Logs DB':health.databases?.logs?.ok?'ok':'fail',
+      'Checked':fmtTime(health.checked_at)
+    });
+  }catch(e){setPill('notion-pill','bad','error')}
+
+  try{
+    const soak=await j('/api/soak/status');
+    setPill('soak-pill',soak.phase==='active'?'ok':'warn',soak.phase||'unknown');
+    kv(document.getElementById('soak-kv'),{
+      'Start':fmtTime(soak.soak_start),
+      'Now':fmtTime(soak.now),
+      'H+6':soak.checkpoints_et?.alpha_h6||fmtTime(soak.h6),
+      'H+18':soak.checkpoints_et?.beta_h18||fmtTime(soak.h18),
+      'H+24':soak.checkpoints_et?.gamma_h24||fmtTime(soak.h24),
+      'Next':fmtTime(soak.next_checkpoint),
+      'Rollback':soak.rollback_trigger||'—'
+    });
+  }catch(e){setPill('soak-pill','bad','error')}
+
+  try{
+    const problems=await j('/api/commands/problem');
+    const rows=problems.rows||[];
+    setPill('commands-pill',rows.length===0?'ok':'bad',rows.length===0?'clean':`${rows.length} problem`);
+    renderMiniList('commands-problem-list',rows.slice(0,5),'No pending/running/failed/blocked commands.',r=>`
+      <div class="mini-row card-error">
+        <div class="mini-title">${esc(shortText(r.command))}</div>
+        <div class="mini-meta">${esc(r.status)} · ${esc(r.kind||'—')} · ${esc(fmtTime(r.created_at))}</div>
+        <div class="mini-meta">${esc(shortText(r.result))}</div>
+      </div>`);
+  }catch(e){setPill('commands-pill','bad','error')}
+
+  try{
+    const recent=await j('/api/commands/recent');
+    renderMiniList('commands-recent-list',(recent.rows||[]).slice(0,5),'No recent commands.',r=>`
+      <div class="mini-row">
+        <div class="mini-title">${esc(shortText(r.command))}</div>
+        <div class="mini-meta">${esc(r.status)} · ${esc(r.kind||'—')} · ${esc(r.risk||'—')} · ${esc(fmtTime(r.created_at))}</div>
+      </div>`);
+  }catch(e){renderMiniList('commands-recent-list',[],'Recent commands unavailable.',()=> '')}
+
+  try{
+    const autos=await j('/api/automations');
+    const rows=autos.rows||[];
+    const enabled=rows.filter(r=>r.enabled);
+    setPill('autos-pill',enabled.length>0?'ok':'warn',`${enabled.length} enabled`);
+    renderMiniList('automations-list',rows,'No automations found.',r=>`
+      <div class="mini-row ${r.enabled?'':'card-warn'}">
+        <div class="mini-title">${esc(shortText(r.name))} ${r.enabled?'✅':'⏸️'}</div>
+        <div class="mini-meta">${esc(r.kind||'—')} · every ${esc(r.interval_sec||'—')}s · run #${esc(r.run_count??'—')}</div>
+        <div class="mini-meta">Last: ${esc(fmtTime(r.last_run))}</div>
+        <div class="mini-meta">${esc(shortText(r.last_result,120))}</div>
+      </div>`);
+  }catch(e){setPill('autos-pill','bad','error')}
+
+  try{
+    const logs=await j('/api/logs/recent');
+    const rows=logs.rows||[];
+    const hasErrors=rows.some(r=>r.level==='error');
+    const hasWarns=rows.some(r=>r.level==='warn');
+    setPill('logs-pill',hasErrors?'bad':hasWarns?'warn':'ok',hasErrors?'errors':hasWarns?'warnings':`${rows.length} logs`);
+    renderMiniList('logs-list',rows.slice(0,8),'No logs found.',r=>`
+      <div class="mini-row ${r.level==='error'?'card-error':r.level==='warn'?'card-warn':''}">
+        <div class="mini-title">${esc(shortText(r.event))}</div>
+        <div class="mini-meta">${esc(r.level||'—')} · ${esc(r.kind||'—')} · ${esc(fmtTime(r.timestamp))}</div>
+        <div class="mini-meta">${esc(shortText(r.payload,160))}</div>
+      </div>`);
+  }catch(e){setPill('logs-pill','bad','error')}
+}
+
+refresh();
+refreshAutomationCenter();
+setInterval(refresh,2000);
+setInterval(refreshAutomationCenter,30000);
 </script></body></html>
 '@
 
@@ -314,7 +726,7 @@ refresh();setInterval(refresh,2000)
 # HTTP server
 # ============================================================
 function Write-Json { param($Context, $Object, [int]$Status = 200)
-    $json = $Object | ConvertTo-Json -Depth 8 -Compress
+    $json = $Object | ConvertTo-Json -Depth 10 -Compress
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
     $Context.Response.StatusCode = $Status
     $Context.Response.ContentType = 'application/json; charset=utf-8'
@@ -347,15 +759,11 @@ Add-LogEntry -Kind 'BOOT' -Message "Home Base $VERSION listening on http://local
 if ($NOTION_ENABLED) {
     Add-LogEntry -Kind 'BOOT' -Message "Notion Command Bus enabled (poll every ${NOTION_POLL_SECONDS}s)"
 } else {
-    Add-LogEntry -Kind 'BOOT' -Message 'Notion Command Bus DISABLED — set ATOMARCADE_NOTION_TOKEN and ATOMARCADE_NOTION_DB_ID env vars to enable.'
+    Add-LogEntry -Kind 'BOOT' -Message 'Notion Command Bus DISABLED -- set ATOMARCADE_NOTION_TOKEN and ATOMARCADE_NOTION_DB_ID env vars to enable.'
 }
 Write-Host ""; Write-Host "  Open: http://localhost:$HTTP_PORT/"; Write-Host "  Stop: Ctrl+C"; Write-Host ""
 
-# --- Background runspace for Notion polling ---
-$pollerJob = $null
 if ($NOTION_ENABLED) {
-    # We do the polling inline between HTTP requests using a timer pattern instead of a runspace,
-    # to keep state shared and avoid concurrency on $script:Log.
     $script:LastNotionPoll = [datetime]::MinValue
 }
 
@@ -401,6 +809,15 @@ try {
                     Write-Json -Context $ctx -Object $payload; break
                 }
                 '^GET /api/log$' { Write-Json -Context $ctx -Object $script:Log; break }
+
+                # v0.5 read-only Automation Center endpoints
+                '^GET /api/notion/health$' { Write-Json -Context $ctx -Object (Get-NotionHealth); break }
+                '^GET /api/automations$' { Write-Json -Context $ctx -Object (Get-AutomationsReadOnly); break }
+                '^GET /api/commands/recent$' { Write-Json -Context $ctx -Object (Get-CommandsRecent); break }
+                '^GET /api/commands/problem$' { Write-Json -Context $ctx -Object (Get-CommandsProblem); break }
+                '^GET /api/logs/recent$' { Write-Json -Context $ctx -Object (Get-LogsRecent); break }
+                '^GET /api/soak/status$' { Write-Json -Context $ctx -Object (Get-SoakStatus); break }
+
                 '^POST /api/retroarch/command$' {
                     $body = Read-JsonBody -Context $ctx
                     $cmd = [string]$body.cmd
