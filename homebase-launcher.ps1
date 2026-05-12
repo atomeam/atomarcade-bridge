@@ -1,4 +1,4 @@
-# AtomArcade Home Base - one-click launcher (v0.6.4)
+# AtoMind Home Base - one-click launcher (v0.6.5)
 # Starts the bridge if it isn't running, then opens Home Base in an Edge --app window.
 # Idempotent: safe to run any number of times. Writes diagnostics to homebase-launcher.log.
 
