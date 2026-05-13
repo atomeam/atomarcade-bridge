@@ -1,0 +1,63 @@
+# VIKTOR Generic worker config for AtoMind/HomeBase
+# Place this config.yaml next to the VIKTOR worker executable on the worker machine.
+# Restart the worker after changing this file; VIKTOR reads config once at startup.
+#
+# IMPORTANT:
+# - These tasks run local PowerShell scripts on the worker host.
+# - Use maxParallelProcesses: 1 because the HomeBase repo path and localhost:8080 are stateful shared resources.
+# - Keep these commands allowlisted; do not expose arbitrary shell execution.
+
+executables:
+  homebase_port_diagnose:
+    path: 'C:\Program Files\PowerShell\7\pwsh.exe'
+    arguments:
+      - '-NoLogo'
+      - '-NoProfile'
+      - '-ExecutionPolicy'
+      - 'Bypass'
+      - '-File'
+      - 'C:\AtomArcade\atomarcade-bridge\tools\viktor-homebase-worker.ps1'
+      - '-Task'
+      - 'port-diagnose'
+    workingDirectoryPath: 'C:\AtomArcade\atomarcade-bridge'
+
+  homebase_repair_smoke:
+    path: 'C:\Program Files\PowerShell\7\pwsh.exe'
+    arguments:
+      - '-NoLogo'
+      - '-NoProfile'
+      - '-ExecutionPolicy'
+      - 'Bypass'
+      - '-File'
+      - 'C:\AtomArcade\atomarcade-bridge\tools\viktor-homebase-worker.ps1'
+      - '-Task'
+      - 'repair-smoke'
+    workingDirectoryPath: 'C:\AtomArcade\atomarcade-bridge'
+
+  homebase_repair_real:
+    path: 'C:\Program Files\PowerShell\7\pwsh.exe'
+    arguments:
+      - '-NoLogo'
+      - '-NoProfile'
+      - '-ExecutionPolicy'
+      - 'Bypass'
+      - '-File'
+      - 'C:\AtomArcade\atomarcade-bridge\tools\viktor-homebase-worker.ps1'
+      - '-Task'
+      - 'repair-real'
+    workingDirectoryPath: 'C:\AtomArcade\atomarcade-bridge'
+
+  homebase_smoke_test:
+    path: 'C:\Program Files\PowerShell\7\pwsh.exe'
+    arguments:
+      - '-NoLogo'
+      - '-NoProfile'
+      - '-ExecutionPolicy'
+      - 'Bypass'
+      - '-File'
+      - 'C:\AtomArcade\atomarcade-bridge\tools\viktor-homebase-worker.ps1'
+      - '-Task'
+      - 'smoke-test'
+    workingDirectoryPath: 'C:\AtomArcade\atomarcade-bridge'
+
+maxParallelProcesses: 1
