@@ -1,13 +1,14 @@
 # ============================================================
-# AtoMind Home Base — Desktop Launcher (v0.6.8.1)
+# AtoMind Home Base — Desktop Launcher (v0.6.8.2)
 # ============================================================
 # Starts the browser Automation Center in homebase.ps1 and the AI Chat Runtime
 # sidecar when needed, then opens both local app surfaces.
+# v0.6.8.2 also ensures the main cockpit embeds the chat panel.
 # ============================================================
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$Version = 'v0.6.8.1-integrated-chat-launcher'
+$Version = 'v0.6.8.2-in-cockpit-chat-launcher'
 $Port    = 8080
 $ChatPort = if ($env:HB_CHAT_PORT) { [int]$env:HB_CHAT_PORT } else { 8081 }
 $Url     = "http://localhost:$Port/"
@@ -16,6 +17,7 @@ $ChatUrl = "http://localhost:$ChatPort/"
 $ChatHealthUrl = "${ChatUrl}api/chat/status"
 $Script  = Join-Path $PSScriptRoot 'homebase.ps1'
 $ChatScript = Join-Path $PSScriptRoot 'tools\homebase-ai-chat-runtime.ps1'
+$EmbedScript = Join-Path $PSScriptRoot 'tools\ensure-in-cockpit-chat.ps1'
 
 function Test-EndpointUp {
     param([string]$Endpoint)
@@ -64,6 +66,12 @@ function Start-PwshScript {
 if (-not (Test-Path $Script)) {
     Show-ErrorMessage "Could not find homebase.ps1 next to this launcher.`n`nExpected: $Script"
     exit 1
+}
+
+# v0.6.8.2: ensure the main 8080 cockpit contains the embedded 8081 AI chat card.
+# Idempotent; only modifies local homebase.ps1 if the card is missing.
+if (Test-Path $EmbedScript) {
+    & $EmbedScript | Out-Null
 }
 
 if (-not (Test-EndpointUp $HealthUrl)) {

@@ -9,6 +9,7 @@ $Url        = "http://localhost:$Port/"
 $ChatUrl    = "http://localhost:$ChatPort/"
 $Script     = Join-Path $PSScriptRoot 'homebase.ps1'
 $ChatScript = Join-Path $PSScriptRoot 'tools\homebase-ai-chat-runtime.ps1'
+$EmbedScript = Join-Path $PSScriptRoot 'tools\ensure-in-cockpit-chat.ps1'
 
 function Test-UrlUp {
     param([string]$HealthUrl)
@@ -36,6 +37,12 @@ if (-not (Test-Path $Script)) {
         'AtoMind Home Base', 'OK', 'Error'
     ) | Out-Null
     exit 1
+}
+
+# v0.6.8.2: ensure the main 8080 cockpit contains the embedded 8081 AI chat card.
+# Idempotent; only modifies local homebase.ps1 if the card is missing.
+if (Test-Path $EmbedScript) {
+    & $EmbedScript | Out-Null
 }
 
 if (-not (Test-UrlUp "${Url}api/status")) {
