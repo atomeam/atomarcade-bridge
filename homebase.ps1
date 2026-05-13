@@ -21,6 +21,8 @@ $NOTION_TOKEN          = $env:ATOMARCADE_NOTION_TOKEN
 $NOTION_DATABASE_ID    = $env:ATOMARCADE_NOTION_DB_ID
 $NOTION_AUTO_DB_ID     = $env:ATOMARCADE_NOTION_AUTO_DB_ID
 $NOTION_LOG_DB_ID      = $env:ATOMARCADE_NOTION_LOG_DB_ID
+$NOTION_NUCLEUS_LOG_DB_ID = $env:ATOMARCADE_NUCLEUS_LOG_DB_ID
+$BRIDGE_ENVIRONMENT    = if ([string]::IsNullOrWhiteSpace($env:ATOMARCADE_BRIDGE_ENVIRONMENT)) { 'homebase-desktop' } else { $env:ATOMARCADE_BRIDGE_ENVIRONMENT }
 $NOTION_POLL_SECONDS   = 5
 $NOTION_API_VERSION    = '2022-06-28'
 $NOTION_ENABLED        = -not [string]::IsNullOrWhiteSpace($NOTION_TOKEN) -and -not [string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)
@@ -259,6 +261,245 @@ function Invoke-NotionLog {
 }
 
 # ============================================================
+# Nucleus Routing Log v0 emitter (Rubric §10 handshake contract)
+# ------------------------------------------------------------
+# Emits one canonical handshake row per Bridge dispatch to the
+# Nucleus Routing Log Notion DB. The Bridge owns these columns:
+#   Trace ID, Kind, Action, Decision, Layer Failed, Deny Code,
+#   Deny Detail, Latency (ms), Mode, Environment, User ID,
+#   Params Hash, Payload Snippet, Policy Version, Fallback Fired,
+#   Source Row, Logged At (created_time, auto).
+# Nucleus-side passthroughs (Task Class, Modifiers, Parent Trace
+# ID) are accepted from the incoming args JSON if Notion AI
+# included them; otherwise left null.
+# AD-015 alignment: every emit mirrors to homebase-logs.jsonl.
+# AD-019 alignment: Latency (ms) is the handshake roundtrip in
+# this process. Fails CLOSED: a routing-log emit error never
+# breaks the dispatch path.
+# ============================================================
+function New-NucleusTraceId {
+    $date = (Get-Date).ToString('yyyyMMdd')
+    $bytes = New-Object byte[] 4
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    $hex = ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLower()
+    return "AT-NUC-$date-$hex"
+}
+
+function Get-NucleusParamsHash {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    try {
+        $sha   = [System.Security.Cryptography.SHA256]::Create()
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+        $hash  = $sha.ComputeHash($bytes)
+        return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLower()
+    } catch {
+        return ''
+    }
+}
+
+# Map free-text Curator deny reasons to Curator Policy v0 deny codes.
+# Returns @{ code=<one of the 10 Routing Log Deny Code options, or $null>; layer=<Layer Failed option> }.
+# Unknown reasons return { code=$null; layer='preflight' } so Notion API
+# is never asked to set a Deny Code option that doesn't exist on the DB.
+function Resolve-BridgeDenyReason {
+    param([string]$Reason)
+    if ([string]::IsNullOrWhiteSpace($Reason)) {
+        return @{ code = $null; layer = 'none' }
+    }
+    switch -Regex ($Reason) {
+        "kind '[^']*' is disabled"  { return @{ code = 'CURATOR_DENY_KIND_DISABLED';       layer = 'layer_1_kind' } }
+        'unknown kind'              { return @{ code = 'CURATOR_DENY_KIND_DISABLED';       layer = 'layer_1_kind' } }
+        'risk=high blocked'         { return @{ code = 'CURATOR_DENY_RISK_HIGH_NOT_ARMED'; layer = 'layer_2_risk' } }
+        'not on allowlist'          { return @{ code = 'CURATOR_DENY_NOT_ON_ALLOWLIST';    layer = 'layer_3_allowlist' } }
+        default                     { return @{ code = $null;                              layer = 'preflight' } }
+    }
+}
+
+function Invoke-NucleusRoutingLog {
+    param(
+        [Parameter(Mandatory)][string]$TraceId,
+        [Parameter(Mandatory)][string]$Decision,
+        [string]$Kind,
+        [string]$Action,
+        [string]$LayerFailed   = 'none',
+        [string]$DenyCode,
+        [string]$DenyDetail,
+        [int]$LatencyMs        = 0,
+        [string]$Mode          = 'PROD',
+        [string]$Environment,
+        [string]$UserId,
+        [string]$ParamsHash,
+        [string]$PayloadSnippet,
+        [string]$PolicyVersion,
+        [bool]$FallbackFired   = $false,
+        [string]$SourceRowUrl,
+        [string]$TaskClass,
+        [string[]]$Modifiers,
+        [string]$ParentTraceId
+    )
+    if ([string]::IsNullOrWhiteSpace($NOTION_TOKEN)) {
+        return @{ ok = $false; error = 'ATOMARCADE_NOTION_TOKEN not set'; skipped = $true }
+    }
+    if ([string]::IsNullOrWhiteSpace($NOTION_NUCLEUS_LOG_DB_ID)) {
+        return @{ ok = $false; error = 'ATOMARCADE_NUCLEUS_LOG_DB_ID not set'; skipped = $true }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Environment))   { $Environment   = $BRIDGE_ENVIRONMENT }
+    if ([string]::IsNullOrWhiteSpace($PolicyVersion)) { $PolicyVersion = $GOVERNANCE_HASH }
+
+    if ($DenyDetail     -and $DenyDetail.Length     -gt 1900) { $DenyDetail     = $DenyDetail.Substring(0, 1900) + ' ...[truncated]' }
+    if ($PayloadSnippet -and $PayloadSnippet.Length -gt 512)  { $PayloadSnippet = $PayloadSnippet.Substring(0, 509) + '...' }
+    if ($Action         -and $Action.Length         -gt 190)  { $Action         = $Action.Substring(0, 190) + '…' }
+
+    $props = @{
+        'Trace ID'       = @{ title    = @(@{ text = @{ content = $TraceId } }) }
+        Decision         = @{ select   = @{ name = $Decision } }
+        'Layer Failed'   = @{ select   = @{ name = $LayerFailed } }
+        Mode             = @{ select   = @{ name = $Mode } }
+        Environment      = @{ select   = @{ name = $Environment } }
+        'Policy Version' = @{ select   = @{ name = $PolicyVersion } }
+        'Fallback Fired' = @{ checkbox = $FallbackFired }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Kind))           { $props.Kind              = @{ select       = @{ name = $Kind } } }
+    if (-not [string]::IsNullOrWhiteSpace($Action))         { $props.Action            = @{ rich_text    = @(@{ text = @{ content = $Action } }) } }
+    if (-not [string]::IsNullOrWhiteSpace($DenyCode))       { $props.'Deny Code'       = @{ select       = @{ name = $DenyCode } } }
+    if (-not [string]::IsNullOrWhiteSpace($DenyDetail))     { $props.'Deny Detail'     = @{ rich_text    = @(@{ text = @{ content = $DenyDetail } }) } }
+    if ($LatencyMs -gt 0)                                   { $props.'Latency (ms)'    = @{ number       = $LatencyMs } }
+    if (-not [string]::IsNullOrWhiteSpace($UserId))         { $props.'User ID'         = @{ rich_text    = @(@{ text = @{ content = $UserId } }) } }
+    if (-not [string]::IsNullOrWhiteSpace($ParamsHash))     { $props.'Params Hash'     = @{ rich_text    = @(@{ text = @{ content = $ParamsHash } }) } }
+    if (-not [string]::IsNullOrWhiteSpace($PayloadSnippet)) { $props.'Payload Snippet' = @{ rich_text    = @(@{ text = @{ content = $PayloadSnippet } }) } }
+    if (-not [string]::IsNullOrWhiteSpace($SourceRowUrl))   { $props.'Source Row'      = @{ url          = $SourceRowUrl } }
+    if (-not [string]::IsNullOrWhiteSpace($TaskClass))      { $props.'Task Class'      = @{ select       = @{ name = $TaskClass } } }
+    if ($Modifiers -and $Modifiers.Count -gt 0)             { $props.Modifiers         = @{ multi_select = @($Modifiers | ForEach-Object { @{ name = [string]$_ } }) } }
+    if (-not [string]::IsNullOrWhiteSpace($ParentTraceId))  { $props.'Parent Trace ID' = @{ rich_text    = @(@{ text = @{ content = $ParentTraceId } }) } }
+
+    $body = @{
+        parent     = @{ database_id = $NOTION_NUCLEUS_LOG_DB_ID }
+        properties = $props
+    } | ConvertTo-Json -Depth 12
+
+    try {
+        $r = Invoke-RestMethod -Uri 'https://api.notion.com/v1/pages' `
+            -Method Post -Headers $script:NotionHeaders -Body $body -TimeoutSec 15
+        Write-LocalJsonLog -Event 'nucleus-routing-log' -Level 'info' -Kind $Kind -Origin 'nucleus' `
+            -Command $Action -Status $Decision -Result $r.id `
+            -Payload "trace=$TraceId deny=$DenyCode layer=$LayerFailed latency=${LatencyMs}ms"
+        return @{ ok = $true; page_id = $r.id; trace_id = $TraceId }
+    } catch {
+        Write-LocalJsonLog -Event 'nucleus-routing-log' -Level 'error' -Kind $Kind -Origin 'nucleus' `
+            -Command $Action -Status 'emit_failed' -Result $_.Exception.Message `
+            -Payload "trace=$TraceId"
+        return @{ ok = $false; error = $_.Exception.Message; trace_id = $TraceId }
+    }
+}
+
+# Wrapper around Invoke-BridgeCommand that emits a Nucleus Routing Log row
+# per dispatch. Invoke-BridgeCommand itself is untouched — Curator logic
+# stays exactly as-is. This wrapper only observes the decision and reason,
+# then emits. Emit failures NEVER break the dispatch path.
+function Invoke-BridgeCommandTraced {
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [string]$Kind = 'retroarch',
+        [string]$Risk = 'low',
+        [string]$ArgsJson = $null
+    )
+
+    $startTs    = Get-Date
+    $traceId    = New-NucleusTraceId
+    $paramsHash = Get-NucleusParamsHash -Text $ArgsJson
+    $payload    = if ($ArgsJson) { [string]$ArgsJson } else { '' }
+
+    # Optional Nucleus-side passthroughs (Notion AI queues them in args JSON when known).
+    $taskClass     = $null
+    $modifiers     = @()
+    $parentTraceId = $null
+    $userId        = ''
+    $mode          = 'PROD'
+    if ($ArgsJson) {
+        try {
+            $argsObj = $ArgsJson | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+            if ($argsObj.task_class)      { $taskClass     = [string]$argsObj.task_class }
+            if ($argsObj.modifiers)       { $modifiers     = @($argsObj.modifiers | ForEach-Object { [string]$_ }) }
+            if ($argsObj.parent_trace_id) { $parentTraceId = [string]$argsObj.parent_trace_id }
+            if ($argsObj.user_id)         { $userId        = [string]$argsObj.user_id }
+            if ($argsObj.mode)            { $mode          = [string]$argsObj.mode }
+        } catch {}
+    }
+    if ([string]::IsNullOrWhiteSpace($mode)) { $mode = 'PROD' }
+
+    $result      = $null
+    $decision    = 'ALLOW'
+    $denyCode    = $null
+    $layerFailed = 'none'
+    $denyDetail  = ''
+
+    try {
+        $result = Invoke-BridgeCommand -Command $Command -Kind $Kind -Risk $Risk -ArgsJson $ArgsJson
+
+        if ($result -and ($result.blocked -eq $true)) {
+            $decision    = 'DENY'
+            $denyDetail  = if ($result.reason) { [string]$result.reason } else { 'blocked' }
+            $mapping     = Resolve-BridgeDenyReason -Reason $denyDetail
+            $denyCode    = $mapping.code
+            $layerFailed = $mapping.layer
+        }
+        elseif ($result -and ($result.ok -eq $false)) {
+            # Non-blocked failure (transport, validation, etc.).
+            $decision    = 'DENY'
+            $layerFailed = 'preflight'
+            $denyDetail  = if ($result.error)       { [string]$result.error }
+                           elseif ($result.reason)  { [string]$result.reason }
+                           else                     { 'dispatch failed' }
+        }
+    } catch {
+        $decision    = 'DENY'
+        $layerFailed = 'preflight'
+        $denyDetail  = "Bridge exception: $($_.Exception.Message)"
+        $result      = @{ ok = $false; error = $_.Exception.Message }
+    }
+
+    $latencyMs = [int]((Get-Date) - $startTs).TotalMilliseconds
+
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($NOTION_NUCLEUS_LOG_DB_ID)) {
+            $emit = Invoke-NucleusRoutingLog `
+                -TraceId       $traceId `
+                -Decision      $decision `
+                -Kind          $Kind `
+                -Action        $Command `
+                -LayerFailed   $layerFailed `
+                -DenyCode      $denyCode `
+                -DenyDetail    $denyDetail `
+                -LatencyMs     $latencyMs `
+                -Mode          $mode `
+                -Environment   $BRIDGE_ENVIRONMENT `
+                -UserId        $userId `
+                -ParamsHash    $paramsHash `
+                -PayloadSnippet $payload `
+                -PolicyVersion $GOVERNANCE_HASH `
+                -FallbackFired $false `
+                -TaskClass     $taskClass `
+                -Modifiers     $modifiers `
+                -ParentTraceId $parentTraceId
+            if ($emit -and -not $emit.ok -and -not $emit.skipped) {
+                $msg = if ($emit.error) { [string]$emit.error } else { 'unknown' }
+                Add-LogEntry -Kind 'NUCLEUS_ROUTING_LOG_ERR' -Message $msg
+            }
+        }
+    } catch {
+        Add-LogEntry -Kind 'NUCLEUS_ROUTING_LOG_ERR' -Message $_.Exception.Message
+    }
+
+    # Echo trace id back so the corresponding notion-log row can join on it.
+    if ($result -is [hashtable] -or $result -is [System.Collections.IDictionary]) {
+        try { $result['trace_id'] = $traceId } catch {}
+    }
+    return $result
+}
+
+# ============================================================
 # Bridge Command dispatcher
 # ============================================================
 function Invoke-BridgeCommand {
@@ -414,7 +655,7 @@ function Tick-NotionPoller {
             Add-LogEntry -Kind 'NOTION_CMD' -Message "$kind/$command" -Data @{ risk=$risk; args=$argsRaw }
 
             try {
-                $result = Invoke-BridgeCommand -Command $command -Kind $kind -Risk $risk -ArgsJson $argsRaw
+                $result = Invoke-BridgeCommandTraced -Command $command -Kind $kind -Risk $risk -ArgsJson $argsRaw
                 $json = $result | ConvertTo-Json -Depth 6 -Compress
                 if ($result.blocked) {
                     Update-CommandRow -PageId $pageId -Status 'Blocked' -Result $json -SetExecutedAt
@@ -447,6 +688,7 @@ function Get-ConfigStatus {
         commands_db_present    = -not [string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)
         automations_db_present = -not [string]::IsNullOrWhiteSpace($NOTION_AUTO_DB_ID)
         logs_db_present        = -not [string]::IsNullOrWhiteSpace($NOTION_LOG_DB_ID)
+        nucleus_log_db_present = -not [string]::IsNullOrWhiteSpace($NOTION_NUCLEUS_LOG_DB_ID)
     }
 }
 
@@ -941,6 +1183,7 @@ async function refreshAutomationCenter(){
       'Commands DB':health.databases?.commands?.ok?'ok':'fail',
       'Automations DB':health.databases?.automations?.ok?'ok':'fail',
       'Logs DB':health.databases?.logs?.ok?'ok':'fail',
+      'Nucleus Log DB':health.config?.nucleus_log_db_present?'present':'missing',
       'Checked':fmtTime(health.checked_at)
     });
   }catch(e){setPill('notion-pill','bad','error')}
@@ -949,256 +1192,4 @@ async function refreshAutomationCenter(){
     const snap=await j('/api/health/snapshot');
     const gs=snap.golden_signals||{};
     const errPct=Math.round((gs.error_rate||0)*1000)/10;
-    setPill('golden-pill',errPct>5?'bad':errPct>1?'warn':'ok',errPct+'% err');
-    kv(document.getElementById('golden-kv'),{
-      'Latency (last)':(gs.latency_last_ms||0)+' ms',
-      'Traffic':(gs.traffic_rps||0)+' req/s',
-      'Error rate':errPct+'%',
-      'Memory':((gs.saturation||{}).working_set_mb||0)+' MB',
-      'CPU sec':(gs.saturation||{}).cpu_seconds||0,
-      'JSONL bytes':(snap.local_jsonl||{}).bytes||0
-    });
-    const wbo=snap.writes_by_origin||{};
-    const total=Object.values(wbo).reduce((a,b)=>a+(b||0),0);
-    const cockpit=wbo.cockpit||0;
-    const pct=total>0?Math.round((cockpit/total)*1000)/10:0;
-    setPill('kpi-pill',pct>=70?'ok':pct>=30?'warn':'bad',pct+'%');
-    kv(document.getElementById('kpi-kv'),{
-      'Cockpit writes':cockpit,
-      'Notion-direct':wbo['notion-direct']||0,
-      'Automation':wbo.automation||0,
-      'Other':(wbo.external||0)+(wbo.unknown||0),
-      'Total writes':total,
-      'Cockpit %':pct+'%'
-    });
-  }catch(e){setPill('golden-pill','bad','error');setPill('kpi-pill','bad','error')}
-
-  try{
-    const soak=await j('/api/soak/status');
-    setPill('soak-pill',soak.phase==='active'?'ok':'warn',soak.phase||'unknown');
-    kv(document.getElementById('soak-kv'),{
-      'Start':fmtTime(soak.soak_start),
-      'Now':fmtTime(soak.now),
-      'H+6':soak.checkpoints_et?.alpha_h6||fmtTime(soak.h6),
-      'H+18':soak.checkpoints_et?.beta_h18||fmtTime(soak.h18),
-      'H+24':soak.checkpoints_et?.gamma_h24||fmtTime(soak.h24),
-      'Next':fmtTime(soak.next_checkpoint),
-      'Rollback':soak.rollback_trigger||'—'
-    });
-  }catch(e){setPill('soak-pill','bad','error')}
-
-  try{
-    const problems=await j('/api/commands/problem');
-    const rows=problems.rows||[];
-    setPill('commands-pill',rows.length===0?'ok':'bad',rows.length===0?'clean':`${rows.length} problem`);
-    renderMiniList('commands-problem-list',rows.slice(0,5),'No pending/running/failed/blocked commands.',r=>`
-      <div class="mini-row card-error">
-        <div class="mini-title">${esc(shortText(r.command))}</div>
-        <div class="mini-meta">${esc(r.status)} · ${esc(r.kind||'—')} · ${esc(fmtTime(r.created_at))}</div>
-        <div class="mini-meta">${esc(shortText(r.result))}</div>
-        <button class="mini" onclick="retryCommand(${jstr(r.command)},${jstr(r.kind)},${jstr(r.risk)})">Retry</button>
-      </div>`);
-  }catch(e){setPill('commands-pill','bad','error')}
-
-  try{
-    const recent=await j('/api/commands/recent');
-    renderMiniList('commands-recent-list',(recent.rows||[]).slice(0,5),'No recent commands.',r=>`
-      <div class="mini-row">
-        <div class="mini-title">${esc(shortText(r.command))}</div>
-        <div class="mini-meta">${esc(r.status)} · ${esc(r.kind||'—')} · ${esc(r.risk||'—')} · ${esc(fmtTime(r.created_at))}</div>
-        <button class="mini" onclick="retryCommand(${jstr(r.command)},${jstr(r.kind)},${jstr(r.risk)})">Retry</button>
-      </div>`);
-  }catch(e){renderMiniList('commands-recent-list',[],'Recent commands unavailable.',()=> '')}
-
-  try{
-    const autos=await j('/api/automations');
-    const rows=autos.rows||[];
-    const enabled=rows.filter(r=>r.enabled);
-    setPill('autos-pill',enabled.length>0?'ok':'warn',`${enabled.length} enabled`);
-    renderMiniList('automations-list',rows,'No automations found.',r=>`
-      <div class="mini-row ${r.enabled?'':'card-warn'}">
-        <div class="mini-title">${esc(shortText(r.name))} ${r.enabled?'✅':'⏸️'}</div>
-        <div class="mini-meta">${esc(r.kind||'—')} · every ${esc(r.interval_sec||'—')}s · run #${esc(r.run_count??'—')}</div>
-        <div class="mini-meta">Last: ${esc(fmtTime(r.last_run))}</div>
-        <div class="mini-meta">${esc(shortText(r.last_result,120))}</div>
-        <button class="mini" onclick="toggleAutomation(${jstr(r.id)},${r.enabled?'true':'false'})">${r.enabled?'Disable':'Enable'}</button>
-      </div>`);
-  }catch(e){setPill('autos-pill','bad','error')}
-
-  try{
-    const logs=await j('/api/logs/recent');
-    const rows=logs.rows||[];
-    const hasErrors=rows.some(r=>r.level==='error');
-    const hasWarns=rows.some(r=>r.level==='warn');
-    setPill('logs-pill',hasErrors?'bad':hasWarns?'warn':'ok',hasErrors?'errors':hasWarns?'warnings':`${rows.length} logs`);
-    renderMiniList('logs-list',rows.slice(0,8),'No logs found.',r=>`
-      <div class="mini-row ${r.level==='error'?'card-error':r.level==='warn'?'card-warn':''}">
-        <div class="mini-title">${esc(shortText(r.event))}</div>
-        <div class="mini-meta">${esc(r.level||'—')} · ${esc(r.kind||'—')} · ${esc(fmtTime(r.timestamp))}</div>
-        <div class="mini-meta">${esc(shortText(r.payload,160))}</div>
-      </div>`);
-  }catch(e){setPill('logs-pill','bad','error')}
-}
-
-refresh();
-refreshAutomationCenter();
-setInterval(refresh,2000);
-setInterval(refreshAutomationCenter,30000);
-</script></body></html>
-'@
-
-# ============================================================
-# HTTP server
-# ============================================================
-function Write-Json { param($Context, $Object, [int]$Status = 200)
-    $json = $Object | ConvertTo-Json -Depth 10 -Compress
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
-    $Context.Response.StatusCode = $Status
-    $Context.Response.ContentType = 'application/json; charset=utf-8'
-    $Context.Response.ContentLength64 = $bytes.Length
-    $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
-    $Context.Response.OutputStream.Close()
-}
-function Write-Html { param($Context, [string]$Html)
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Html)
-    $Context.Response.StatusCode = 200
-    $Context.Response.ContentType = 'text/html; charset=utf-8'
-    $Context.Response.ContentLength64 = $bytes.Length
-    $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
-    $Context.Response.OutputStream.Close()
-}
-function Write-Text { param($Context, [string]$Text, [string]$ContentType = 'text/plain; charset=utf-8', [int]$Status = 200)
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
-    $Context.Response.StatusCode = $Status
-    $Context.Response.ContentType = $ContentType
-    $Context.Response.ContentLength64 = $bytes.Length
-    $Context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
-    $Context.Response.OutputStream.Close()
-}
-function Read-JsonBody { param($Context)
-    $reader = [System.IO.StreamReader]::new($Context.Request.InputStream, $Context.Request.ContentEncoding)
-    $body = $reader.ReadToEnd(); $reader.Close()
-    if ([string]::IsNullOrWhiteSpace($body)) { return @{} }
-    return ($body | ConvertFrom-Json -AsHashtable)
-}
-
-$listener = [System.Net.HttpListener]::new()
-$listener.Prefixes.Add("http://localhost:$HTTP_PORT/")
-try { $listener.Start() } catch {
-    Write-Error "Failed to bind http://localhost:$HTTP_PORT/. If access denied, run once as admin: netsh http add urlacl url=http://localhost:$HTTP_PORT/ user=$env:USERNAME"
-    throw
-}
-Add-LogEntry -Kind 'BOOT' -Message "Home Base $VERSION listening on http://localhost:$HTTP_PORT/"
-Write-Log "BOOT homebase.ps1 $VERSION started by $env:USERNAME on $($script:Hostname) listening on http://localhost:$HTTP_PORT/"
-Write-LocalJsonLog -Event 'boot' -Level 'info' -Kind 'lifecycle' -Origin 'bridge' -Status 'ok' -Result "$VERSION listening on http://localhost:$HTTP_PORT/"
-if ($NOTION_ENABLED) {
-    Add-LogEntry -Kind 'BOOT' -Message "Notion Command Bus enabled (poll every ${NOTION_POLL_SECONDS}s)"
-} else {
-    Add-LogEntry -Kind 'BOOT' -Message 'Notion Command Bus DISABLED -- set ATOMARCADE_NOTION_TOKEN and ATOMARCADE_NOTION_DB_ID env vars to enable.'
-}
-Write-Host ""; Write-Host "  Open: http://localhost:$HTTP_PORT/"; Write-Host "  Stop: Ctrl+C"; Write-Host ""
-
-if ($NOTION_ENABLED) { $script:LastNotionPoll = [datetime]::MinValue }
-
-try {
-    while ($listener.IsListening) {
-        if ($NOTION_ENABLED -and ((Get-Date) - $script:LastNotionPoll).TotalSeconds -ge $NOTION_POLL_SECONDS) {
-            $script:LastNotionPoll = Get-Date
-            Tick-NotionPoller
-        }
-
-        $asyncResult = $listener.BeginGetContext($null, $null)
-        $signaled = $asyncResult.AsyncWaitHandle.WaitOne(1000)
-        if (-not $signaled) { continue }
-        $ctx = $listener.EndGetContext($asyncResult)
-
-        $req = $ctx.Request; $path = $req.Url.AbsolutePath; $method = $req.HttpMethod
-        $reqStart = Get-Date
-        $script:Metrics.requests_total++
-        try {
-            switch -Regex ("$method $path") {
-                '^GET /$' { Write-Html -Context $ctx -Html $DASHBOARD_HTML; break }
-                '^GET /manifest\.webmanifest$' { Write-Text -Context $ctx -Text (Get-PwaManifest) -ContentType 'application/manifest+json; charset=utf-8'; break }
-                '^GET /sw\.js$' { Write-Text -Context $ctx -Text $SERVICE_WORKER_JS -ContentType 'application/javascript; charset=utf-8'; break }
-                '^GET /icon\.svg$' { Write-Text -Context $ctx -Text $ICON_SVG -ContentType 'image/svg+xml; charset=utf-8'; break }
-                '^GET /api/status$' {
-                    $ping = Send-RetroArchCommand -Command 'GET_STATUS'
-                    $ra = @{ reachable = $ping.ok; raw = $ping.reply; error = $ping.error }
-                    if ($ping.reply) {
-                        $parts = $ping.reply -split ' ', 4
-                        if ($parts.Length -ge 3) { $ra.state = $parts[1]; $ra.system = $parts[2]; $ra.content = if ($parts.Length -ge 4) { $parts[3] } else { $null } }
-                    }
-                    $payload = @{
-                        bridge = @{
-                            ok=$true; version=$VERSION; uptime_seconds=[int]((Get-Date)-$script:Started).TotalSeconds
-                            log_count=$script:Log.Count; hostname=$script:Hostname; governance_hash=$GOVERNANCE_HASH
-                        }
-                        retroarch = $ra
-                        notion_bus = @{
-                            enabled = $NOTION_ENABLED
-                            poll_seconds = $NOTION_POLL_SECONDS
-                            last_poll = if ($script:LastNotionPoll -eq [datetime]::MinValue) { 'never' } else { $script:LastNotionPoll.ToString('o') }
-                            allow_high_risk = $ALLOW_HIGH_RISK
-                            policy_kinds_enabled = ($CURATOR_POLICY.GetEnumerator() | Where-Object { $_.Value } | ForEach-Object { $_.Key }) -join ','
-                        }
-                    }
-                    Write-Json -Context $ctx -Object $payload; break
-                }
-                '^GET /api/log$' { Write-Json -Context $ctx -Object $script:Log; break }
-
-                '^GET /api/notion/health$' { Write-Json -Context $ctx -Object (Get-NotionHealth); break }
-                '^GET /api/health/snapshot$' { Write-Json -Context $ctx -Object (Get-HealthSnapshot); break }
-                '^GET /api/automations$' { Write-Json -Context $ctx -Object (Get-AutomationsReadOnly); break }
-                '^GET /api/commands/recent$' { Write-Json -Context $ctx -Object (Get-CommandsRecent); break }
-                '^GET /api/commands/problem$' { Write-Json -Context $ctx -Object (Get-CommandsProblem); break }
-                '^GET /api/logs/recent$' { Write-Json -Context $ctx -Object (Get-LogsRecent); break }
-                '^GET /api/soak/status$' { Write-Json -Context $ctx -Object (Get-SoakStatus); break }
-
-                '^POST /api/commands/queue$' {
-                    $body = Read-JsonBody -Context $ctx
-                    Write-Json -Context $ctx -Object (Invoke-CommandsQueue -Body $body); break
-                }
-                '^POST /api/commands/retry$' {
-                    $body = Read-JsonBody -Context $ctx
-                    Write-Json -Context $ctx -Object (Invoke-CommandsRetry -Body $body); break
-                }
-                '^POST /api/automations/toggle$' {
-                    $body = Read-JsonBody -Context $ctx
-                    Write-Json -Context $ctx -Object (Invoke-AutomationsToggle -Body $body); break
-                }
-
-                '^POST /api/retroarch/command$' {
-                    $body = Read-JsonBody -Context $ctx
-                    $cmd = [string]$body.cmd
-                    if ([string]::IsNullOrWhiteSpace($cmd)) { Write-Json -Context $ctx -Status 400 -Object @{ ok=$false; error='missing cmd' }; break }
-                    $result = Send-RetroArchCommand -Command $cmd
-                    Add-LogEntry -Kind 'RA_CMD' -Message $cmd -Data $result
-                    Write-Json -Context $ctx -Object $result; break
-                }
-                '^GET /api/retroarch/ping$' {
-                    $result = Send-RetroArchCommand -Command 'GET_STATUS'
-                    Add-LogEntry -Kind 'RA_PING' -Message ($result.reply ?? '(no reply)') -Data $result
-                    Write-Json -Context $ctx -Object $result; break
-                }
-                '^POST /api/notion/poll$' {
-                    if (-not $NOTION_ENABLED) { Write-Json -Context $ctx -Status 409 -Object @{ ok=$false; error='Notion bus not configured' }; break }
-                    Tick-NotionPoller
-                    Write-Json -Context $ctx -Object @{ ok=$true; polled_at=(Get-Date).ToString('o') }; break
-                }
-                default { $script:Metrics.requests_errors++; Write-Json -Context $ctx -Status 404 -Object @{ error='not found'; path=$path } }
-            }
-        } catch {
-            $script:Metrics.requests_errors++
-            Add-LogEntry -Kind 'ERROR' -Message $_.Exception.Message
-            Write-LocalJsonLog -Event 'http-error' -Level 'error' -Kind 'http' -Origin 'bridge' -Command "$method $path" -Status 'fail' -Result $_.Exception.Message
-            try { Write-Json -Context $ctx -Status 500 -Object @{ error = $_.Exception.Message } } catch {}
-        } finally {
-            $script:Metrics.last_request_ms = [int]((Get-Date) - $reqStart).TotalMilliseconds
-        }
-    }
-} finally {
-    $listener.Stop(); $listener.Close()
-    Add-LogEntry -Kind 'SHUTDOWN' -Message 'Home Base stopped'
-    Write-Log "SHUTDOWN homebase.ps1 $VERSION stopped"
-    Write-LocalJsonLog -Event 'shutdown' -Level 'info' -Kind 'lifecycle' -Origin 'bridge' -Status 'ok' -Result "$VERSION stopped cleanly"
-}
+    setPill('golden-pill',errPct
