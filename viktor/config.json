@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "scripts_root": "viktor/scripts",
+  "default_mode": "python",
+  "default_timeout_sec": 120,
+  "command_examples": [
+    {
+      "Command": "viktor.run",
+      "Kind": "viktor",
+      "Risk": "low",
+      "Args": "{\"script\":\"viktor/scripts/test.py\",\"args\":[\"--hello\",\"homebase\"],\"mode\":\"python\",\"timeout_sec\":60}"
+    }
+  ]
+}
