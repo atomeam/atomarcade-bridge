@@ -1,0 +1,70 @@
+# Notion page -> HomeBaseWorkQueue preview mapping
+#
+# Source page:
+#   Keep Council Busy — HomeBase Migration Queue
+#
+# This page is ordinary Notion page content, not a database.
+# The reader maps headings and to-do blocks into queue objects.
+
+source:
+  type: notion_page
+  expected_title: Keep Council Busy — HomeBase Migration Queue
+
+mode: read_only
+writes: 0
+
+lanes:
+  ai-only:
+    heading_match: "^## AI-only migration doables"
+    permission: standing_low_risk
+    item_pattern: "to_do"
+    priority_base: 0
+  mcp-lane:
+    heading_match: "^## MCP lane"
+    permission: scoped_tool_action
+    item_pattern: "to_do"
+    priority_base: 100
+  human-only:
+    heading_match: "^## Human-only lane"
+    permission: operator_required
+    item_pattern: "to_do"
+    priority_base: 200
+
+fields:
+  id: "{lane}-{ordinal:02d}"
+  type: lane
+  payload.title: to_do_text_without_checkbox_or_markdown
+  payload.source: source.expected_title
+  priority: priority_base + ordinal
+  created_at: ingestion_started_at
+  status:
+    unchecked: pending
+    checked: done
+  writes: 0
+
+global_fields:
+  default_rule:
+    heading_match: "^## Default next action"
+    body_until_next_heading: true
+  stop_conditions:
+    line_match_any:
+      - "Stop condition"
+      - "Stop and ask"
+      - "require approval"
+      - "destructive"
+      - "credential"
+      - "billing"
+      - "production"
+      - "public"
+      - "secret"
+
+validation:
+  expected_counts:
+    ai-only: 10
+    mcp-lane: 10
+    human-only: 10
+  require_default_rule: true
+  require_stop_conditions: true
+  require_writes_zero: true
+  forbid_source_mutation: true
+  forbid_command_queue_mutation: true
