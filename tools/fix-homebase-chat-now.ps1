@@ -7,7 +7,8 @@
 
 param(
     [switch]$Smoke,
-    [switch]$Start
+    [switch]$Start,
+    [switch]$KeepNotionPoller
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,6 +28,17 @@ Say 'Setting known-good Ollama Cloud environment variables.'
 [Environment]::SetEnvironmentVariable('HB_AI_MODEL', 'gemma4:31b', 'User')
 [Environment]::SetEnvironmentVariable('HB_AI_TIMEOUT_SEC', '180', 'User')
 [Environment]::SetEnvironmentVariable('HB_AI_INCLUDE_CONTEXT', $null, 'User')
+
+# The HomeBase HTTP server and Notion poller share one PowerShell loop in current builds.
+# If the poller blocks on Notion, /api/chat can hang even in smoke mode. Disable it by default
+# for this repair run; pass -KeepNotionPoller to leave it on.
+if (-not $KeepNotionPoller) {
+    Say 'Disabling Notion poller for chat repair run.'
+    [Environment]::SetEnvironmentVariable('ATOMARCADE_DISABLE_NOTION_POLLER', '1', 'User')
+    $env:ATOMARCADE_DISABLE_NOTION_POLLER = '1'
+} else {
+    Say 'Keeping Notion poller enabled because -KeepNotionPoller was provided.'
+}
 
 $ollamaKey = [Environment]::GetEnvironmentVariable('OLLAMA_API_KEY','User')
 if (-not [string]::IsNullOrWhiteSpace($ollamaKey)) {
@@ -56,9 +68,15 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
 Say 'Running canonical native chat patcher.'
 & pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File $EnsurePath | Write-Host
 
-Say 'Applying emergency smoke-test and Invoke-RestMethod provider patch.'
+Say 'Applying emergency smoke-test, poller-disable, and Invoke-RestMethod provider patch.'
 $text = Get-Content -Path $HomeBasePath -Raw
 Copy-Item $HomeBasePath "$HomeBasePath.bak-chat-fix-now" -Force
+
+# Let repair-mode disable the Notion poller at runtime. This avoids a single-threaded poller blocking /api/chat.
+$text = $text.Replace(
+    "$NOTION_ENABLED        = -not [string]::IsNullOrWhiteSpace($NOTION_TOKEN) -and -not [string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)",
+    "$NOTION_ENABLED        = ($env:ATOMARCADE_DISABLE_NOTION_POLLER -ne '1') -and -not [string]::IsNullOrWhiteSpace($NOTION_TOKEN) -and -not [string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)"
+)
 
 # Add smoke-test bypass immediately before context loading. This proves the UI + /api/chat route independently from Ollama.
 $contextNeedle = '    $context = Get-HomeBaseNativeChatContext'
@@ -77,6 +95,7 @@ $smokeBlock = @'
                 writes = 0
                 context_enabled = $false
                 timeout_sec = $HB_AI_TIMEOUT_NATIVE
+                notion_poller_enabled = $NOTION_ENABLED
             }
         }
     }
@@ -90,7 +109,7 @@ if ($text.Contains($contextNeedle) -and -not $text.Contains('HomeBase /api/chat 
 # Use Invoke-RestMethod like the already-proven direct Ollama Cloud test, not Invoke-WebRequest.
 $providerRegex = '(?s)        \$http = Invoke-WebRequest -Method POST -Uri \$HB_AI_ENDPOINT_NATIVE -Headers \$headers -Body \$reqBody -TimeoutSec \$HB_AI_TIMEOUT_NATIVE -ErrorAction Stop\r?\n        \$raw = if \(\$null -ne \$http\.Content\) \{ \[string\]\$http\.Content \} else \{ '''' \}\r?\n        if \(\[string\]::IsNullOrWhiteSpace\(\$raw\)\) \{ throw ''Provider returned an empty HTTP response\.'' \}\r?\n        \$preview = if \(\$raw\.Length -gt 1200\) \{ \$raw\.Substring\(0,1200\) \+ '' \.\.\.\[truncated\]'' \} else \{ \$raw \}\r?\n        \$res = \$raw \| ConvertFrom-Json\r?\n        \$reply = Get-HomeBaseProviderReply -ResponseObject \$res -RawPreview \$preview'
 $providerReplacement = @'
-        Write-NativeChatAudit -Row @{ ts=(Get-Date).ToString('o'); event='provider_call_start'; provider=$HB_AI_PROVIDER_NATIVE; model=$HB_AI_MODEL_NATIVE; endpoint=$HB_AI_ENDPOINT_NATIVE; timeout_sec=$HB_AI_TIMEOUT_NATIVE; context_enabled=$HB_AI_INCLUDE_CONTEXT_NATIVE }
+        Write-NativeChatAudit -Row @{ ts=(Get-Date).ToString('o'); event='provider_call_start'; provider=$HB_AI_PROVIDER_NATIVE; model=$HB_AI_MODEL_NATIVE; endpoint=$HB_AI_ENDPOINT_NATIVE; timeout_sec=$HB_AI_TIMEOUT_NATIVE; context_enabled=$HB_AI_INCLUDE_CONTEXT_NATIVE; notion_poller_enabled=$NOTION_ENABLED }
         $res = Invoke-RestMethod -Method POST -Uri $HB_AI_ENDPOINT_NATIVE -Headers $headers -Body $reqBody -TimeoutSec $HB_AI_TIMEOUT_NATIVE -ErrorAction Stop
         $preview = ($res | ConvertTo-Json -Depth 20 -Compress)
         if ($preview.Length -gt 1200) { $preview = $preview.Substring(0,1200) + ' ...[truncated]' }
@@ -102,7 +121,7 @@ $text = [regex]::Replace($text, $providerRegex, $providerReplacement)
 Set-Content -Path $HomeBasePath -Value $text -Encoding UTF8
 
 Say 'Verification lines:'
-Select-String -Path $HomeBasePath -Pattern 'v0.6.8.7-native-real-ai-stable','HomeBase /api/chat smoke test works','Invoke-RestMethod -Method POST','provider_call_start','hbReplaceThinking','HB_AI_INCLUDE_CONTEXT' |
+Select-String -Path $HomeBasePath -Pattern 'v0.6.8.7-native-real-ai-stable','HomeBase /api/chat smoke test works','Invoke-RestMethod -Method POST','provider_call_start','hbReplaceThinking','HB_AI_INCLUDE_CONTEXT','ATOMARCADE_DISABLE_NOTION_POLLER','notion_poller_enabled' |
     Select-Object LineNumber, Line |
     Format-Table -AutoSize
 
