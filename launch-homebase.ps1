@@ -1,18 +1,33 @@
 # AtoMind — single-click launcher
-# If Home Base isn't running, start it. Then open the dashboard in the default browser.
-# Used by the desktop shortcut created by install-shortcut.ps1.
+# Starts Home Base and the AI Chat Runtime when needed, then opens the dashboard.
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$Port    = 8080
-$Url     = "http://localhost:$Port/"
-$Script  = Join-Path $PSScriptRoot 'homebase.ps1'
+$Port       = 8080
+$ChatPort   = if ($env:HB_CHAT_PORT) { [int]$env:HB_CHAT_PORT } else { 8081 }
+$Url        = "http://localhost:$Port/"
+$ChatUrl    = "http://localhost:$ChatPort/"
+$Script     = Join-Path $PSScriptRoot 'homebase.ps1'
+$ChatScript = Join-Path $PSScriptRoot 'tools\homebase-ai-chat-runtime.ps1'
 
-function Test-HomeBaseUp {
+function Test-UrlUp {
+    param([string]$HealthUrl)
     try {
-        $r = Invoke-WebRequest -Uri "${Url}api/status" -TimeoutSec 1 -UseBasicParsing -ErrorAction Stop
+        $r = Invoke-WebRequest -Uri $HealthUrl -TimeoutSec 1 -UseBasicParsing -ErrorAction Stop
         return ($r.StatusCode -eq 200)
     } catch { return $false }
+}
+
+function Start-PwshScript {
+    param([string]$Path)
+    $pwsh = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
+    if (-not $pwsh) { $pwsh = (Get-Command powershell -ErrorAction SilentlyContinue)?.Source }
+    if (-not $pwsh) { Write-Error 'No PowerShell found (pwsh or powershell).'; exit 1 }
+
+    Start-Process -FilePath $pwsh `
+        -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File', "`"$Path`"") `
+        -WorkingDirectory $PSScriptRoot `
+        -WindowStyle Minimized
 }
 
 if (-not (Test-Path $Script)) {
@@ -23,23 +38,24 @@ if (-not (Test-Path $Script)) {
     exit 1
 }
 
-if (-not (Test-HomeBaseUp)) {
-    # Launch Home Base in its own minimized PowerShell window so it keeps running
-    # after this launcher exits. Use pwsh if available, fall back to Windows PowerShell.
-    $pwsh = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
-    if (-not $pwsh) { $pwsh = (Get-Command powershell -ErrorAction SilentlyContinue)?.Source }
-    if (-not $pwsh) { Write-Error 'No PowerShell found (pwsh or powershell).'; exit 1 }
-
-    Start-Process -FilePath $pwsh `
-        -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File', "`"$Script`"") `
-        -WorkingDirectory $PSScriptRoot `
-        -WindowStyle Minimized
-
-    # Wait up to 10 seconds for the listener to bind
+if (-not (Test-UrlUp "${Url}api/status")) {
+    Start-PwshScript -Path $Script
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 500
-        if (Test-HomeBaseUp) { break }
+        if (Test-UrlUp "${Url}api/status") { break }
+    }
+}
+
+# Start the integrated AI chat surface with the app. It runs as a local sidecar on 8081.
+# If HB_AI_API_KEY / LLM_API_KEY is set, it auto-connects to the real OpenAI-compatible provider.
+# Otherwise it starts safely in dry-run mode.
+if ((Test-Path $ChatScript) -and -not (Test-UrlUp "${ChatUrl}api/chat/status")) {
+    Start-PwshScript -Path $ChatScript
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-UrlUp "${ChatUrl}api/chat/status") { break }
     }
 }
 
 Start-Process $Url
+Start-Process $ChatUrl
