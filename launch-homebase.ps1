@@ -1,14 +1,12 @@
 # AtoMind — single-click launcher
-# Starts Home Base and the AI Chat Runtime when needed, then opens the dashboard.
+# v0.6.8.6: single-app HomeBase launch. Native AI chat is served by homebase.ps1 on 8080.
+# No iframe sidecar. No automatic 8081 window.
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$Port       = 8080
-$ChatPort   = if ($env:HB_CHAT_PORT) { [int]$env:HB_CHAT_PORT } else { 8081 }
-$Url        = "http://localhost:$Port/"
-$ChatUrl    = "http://localhost:$ChatPort/"
-$Script     = Join-Path $PSScriptRoot 'homebase.ps1'
-$ChatScript = Join-Path $PSScriptRoot 'tools\homebase-ai-chat-runtime.ps1'
+$Port        = 8080
+$Url         = "http://localhost:$Port/"
+$Script      = Join-Path $PSScriptRoot 'homebase.ps1'
 $EmbedScript = Join-Path $PSScriptRoot 'tools\ensure-in-cockpit-chat.ps1'
 
 function Test-UrlUp {
@@ -17,6 +15,15 @@ function Test-UrlUp {
         $r = Invoke-WebRequest -Uri $HealthUrl -TimeoutSec 1 -UseBasicParsing -ErrorAction Stop
         return ($r.StatusCode -eq 200)
     } catch { return $false }
+}
+
+function Stop-PortListener {
+    param([int]$LocalPort)
+    try {
+        Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+    } catch {}
 }
 
 function Start-PwshScript {
@@ -34,35 +41,24 @@ function Start-PwshScript {
 if (-not (Test-Path $Script)) {
     [System.Windows.Forms.MessageBox]::Show(
         "Couldn't find homebase.ps1 next to this launcher.`n`nExpected: $Script",
-        'AtoMind Home Base', 'OK', 'Error'
+        'AtoMind HomeBase', 'OK', 'Error'
     ) | Out-Null
     exit 1
 }
 
-# v0.6.8.2: ensure the main 8080 cockpit contains the embedded 8081 AI chat card.
-# Idempotent; only modifies local homebase.ps1 if the card is missing.
+# Ensure native chat is injected into the 8080 cockpit before boot.
 if (Test-Path $EmbedScript) {
     & $EmbedScript | Out-Null
 }
 
-if (-not (Test-UrlUp "${Url}api/status")) {
-    Start-PwshScript -Path $Script
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Milliseconds 500
-        if (Test-UrlUp "${Url}api/status") { break }
-    }
-}
+# Force restart 8080 so the in-memory dashboard picks up the freshly patched homebase.ps1.
+Stop-PortListener -LocalPort $Port
+Start-Sleep -Milliseconds 500
 
-# Start the integrated AI chat surface with the app. It runs as a local sidecar on 8081.
-# If HB_AI_API_KEY / LLM_API_KEY is set, it auto-connects to the real OpenAI-compatible provider.
-# Otherwise it starts safely in dry-run mode.
-if ((Test-Path $ChatScript) -and -not (Test-UrlUp "${ChatUrl}api/chat/status")) {
-    Start-PwshScript -Path $ChatScript
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Milliseconds 500
-        if (Test-UrlUp "${ChatUrl}api/chat/status") { break }
-    }
+Start-PwshScript -Path $Script
+for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Milliseconds 500
+    if (Test-UrlUp "${Url}api/status") { break }
 }
 
 Start-Process $Url
-Start-Process $ChatUrl

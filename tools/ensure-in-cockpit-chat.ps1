@@ -1,7 +1,6 @@
-# HomeBase v0.6.8.5 — native in-cockpit chat patcher
+# HomeBase v0.6.8.6 — force native in-cockpit chat patcher
 # Purpose: make AI chat run inside the main HomeBase cockpit on port 8080.
-# This removes the fragile iframe dependency on localhost:8081 for the embedded app.
-# Idempotent: injects/replaces the cockpit card, native chat functions, and routes.
+# This removes old iframe cards and all localhost:8081 embedded dependencies.
 
 $ErrorActionPreference = 'Stop'
 
@@ -18,11 +17,11 @@ $text = Get-Content -Path $HomeBasePath -Raw
 $nativeFunctions = @'
 
 # ============================================================
-# HomeBase Native AI Chat (v0.6.8.5)
+# HomeBase Native AI Chat (v0.6.8.6)
 # Runs directly on the main 8080 cockpit. No iframe, no 8081 dependency.
 # Free-form chat. No autonomous writes. Provider controlled by HB_AI_* env vars.
 # ============================================================
-$HB_CHAT_VERSION = 'v0.6.8.5-native-chat'
+$HB_CHAT_VERSION = 'v0.6.8.6-native-chat'
 $HB_AI_PROVIDER_NATIVE = if ($env:HB_AI_PROVIDER) { $env:HB_AI_PROVIDER } elseif ($env:LLM_PROVIDER) { $env:LLM_PROVIDER } else { 'dry-run' }
 $HB_AI_MODEL_NATIVE = if ($env:HB_AI_MODEL) { $env:HB_AI_MODEL } elseif ($env:LLM_MODEL) { $env:LLM_MODEL } else { 'mock-homebase-v0.1' }
 $HB_AI_ENDPOINT_NATIVE = if ($env:HB_AI_ENDPOINT) { $env:HB_AI_ENDPOINT } elseif ($env:LLM_BASE_URL) { $env:LLM_BASE_URL.TrimEnd('/') + '/chat/completions' } else { 'https://api.openai.com/v1/chat/completions' }
@@ -123,16 +122,16 @@ $($context.text)
 }
 '@
 
-if ($text -notmatch 'function Invoke-HomeBaseNativeChat') {
-    $marker = '# ============================================================
+# Remove any previous native function block and insert the current one.
+$text = [regex]::Replace($text, '(?s)\n# ============================================================\r?\n# HomeBase Native AI Chat .*?function Invoke-HomeBaseNativeChat \{.*?\n\}\r?\n(?=# ============================================================\r?\n# HTTP server)', "`n")
+$marker = '# ============================================================
 # HTTP server
 # ============================================================'
-    if (-not $text.Contains($marker)) {
-        Write-Host 'Could not find HTTP server insertion point.'
-        exit 1
-    }
-    $text = $text.Replace($marker, $nativeFunctions + "`n" + $marker)
+if (-not $text.Contains($marker)) {
+    Write-Host 'Could not find HTTP server insertion point.'
+    exit 1
 }
+$text = $text.Replace($marker, $nativeFunctions + "`n" + $marker)
 
 $chatCard = @'
 
@@ -156,28 +155,22 @@ $chatCard = @'
   </div>
 '@
 
-# Replace previous iframe card if it was already injected locally; otherwise insert after Command Bus.
-$start = $text.IndexOf('  <div class="card" id="homebase-chat-card"')
-if ($start -ge 0) {
-    $next = $text.IndexOf('  <div class="card">', $start + 1)
-    if ($next -lt 0) { $next = $text.IndexOf('  <div class="card" style="grid-column: span 2">', $start + 1) }
-    if ($next -gt $start) {
-        $text = $text.Substring(0,$start) + $chatCard + "`n" + $text.Substring($next)
-    }
+# Force-remove old iframe/native chat card. Then insert the clean native card after Command Bus.
+$text = [regex]::Replace($text, '(?s)\s*<div class="card" id="homebase-chat-card".*?</div>\s*(?=\n\s*<div class="card")', "`n")
+$anchor = '  <div class="card" style="grid-column:span 2"><h2>Notion Command Bus</h2><div class="kv" id="bus-kv"></div></div>'
+if ($text.Contains($anchor)) {
+    $text = $text.Replace($anchor, $anchor + $chatCard)
 } else {
-    $anchor = '  <div class="card" style="grid-column:span 2"><h2>Notion Command Bus</h2><div class="kv" id="bus-kv"></div></div>'
-    if ($text.Contains($anchor)) {
-        $text = $text.Replace($anchor, $anchor + $chatCard)
-    } else {
-        $fallback = '<div class="grid">'
-        if (-not $text.Contains($fallback)) {
-            Write-Host 'Could not find dashboard insertion point.'
-            exit 1
-        }
-        $text = $text.Replace($fallback, $fallback + $chatCard)
+    $fallback = '<div class="grid">'
+    if (-not $text.Contains($fallback)) {
+        Write-Host 'Could not find dashboard insertion point.'
+        exit 1
     }
+    $text = $text.Replace($fallback, $fallback + $chatCard)
 }
 
+# Force-remove any previous native chat routes, then add clean routes before /api/log.
+$text = [regex]::Replace($text, '(?m)^\s*''\^GET /api/chat/status\$''.*?\r?\n\s*''\^POST /api/chat\$'' \{\r?\n\s*\$body = Read-JsonBody -Context \$ctx\r?\n\s*Write-Json -Context \$ctx -Object \(Invoke-HomeBaseNativeChat -Body \$body\); break\r?\n\s*\}\r?\n', '')
 $routes = @'
                 '^GET /api/chat/status$' { Write-Json -Context $ctx -Object (Get-HomeBaseNativeChatStatus); break }
                 '^POST /api/chat$' {
@@ -185,15 +178,16 @@ $routes = @'
                     Write-Json -Context $ctx -Object (Invoke-HomeBaseNativeChat -Body $body); break
                 }
 '@
-if ($text -notmatch '\^GET /api/chat/status\$') {
-    $routeAnchor = "                '^GET /api/log$' { Write-Json -Context `$ctx -Object `$script:Log; break }"
-    if (-not $text.Contains($routeAnchor)) {
-        Write-Host 'Could not find route insertion point.'
-        exit 1
-    }
-    $text = $text.Replace($routeAnchor, $routes + $routeAnchor)
+$routeAnchor = "                '^GET /api/log$' { Write-Json -Context `$ctx -Object `$script:Log; break }"
+if (-not $text.Contains($routeAnchor)) {
+    Write-Host 'Could not find route insertion point.'
+    exit 1
 }
+$text = $text.Replace($routeAnchor, $routes + $routeAnchor)
 
+# Force-remove previous hb chat client functions, then add clean functions before refresh().
+$text = [regex]::Replace($text, '(?s)\nasync function hbLoadChatStatus\(\).*?async function hbSendChat\(\).*?\}\r?\n', "`n")
+$text = $text.Replace('hbLoadChatStatus();' + "`n", '')
 $clientJs = @'
 
 async function hbLoadChatStatus(){try{const s=await j('/api/chat/status');document.getElementById('hb-chat-status').textContent='provider='+s.provider+' model='+s.model+' mode='+s.mode+' writes='+s.writes+' version='+s.version}catch(e){document.getElementById('hb-chat-status').textContent='chat status error: '+e.message}}
@@ -201,15 +195,13 @@ function hbAppendChat(who,text){const el=document.getElementById('hb-chat-log');
 function hbSeedChat(t){const el=document.getElementById('hb-chat-input');el.value=t;el.focus()}
 async function hbSendChat(){const input=document.getElementById('hb-chat-input');const msg=(input.value||'').trim();if(!msg)return;input.value='';hbAppendChat('Atom',msg);hbAppendChat('HomeBase','Thinking...');try{const r=await apiPost('/api/chat',{message:msg,user_id:'atom',session_id:'homebase-native-ui'});const log=document.getElementById('hb-chat-log');log.textContent=log.textContent.replace(/HomeBase: Thinking\.\.\.$/,'HomeBase: '+(r.reply||JSON.stringify(r,null,2)));if(r.meta){document.getElementById('hb-chat-status').textContent='provider='+r.meta.provider+' model='+r.meta.model+' mode='+r.meta.mode+' writes='+r.meta.writes+' version='+r.meta.version}}catch(e){hbAppendChat('Error',e.message)}}
 '@
-if ($text -notmatch 'function hbSendChat\(') {
-    $scriptAnchor = 'refresh();
+$scriptAnchor = 'refresh();
 refreshAutomationCenter();'
-    if (-not $text.Contains($scriptAnchor)) {
-        Write-Host 'Could not find client JS insertion point.'
-        exit 1
-    }
-    $text = $text.Replace($scriptAnchor, $clientJs + "`n" + 'hbLoadChatStatus();' + "`n" + $scriptAnchor)
+if (-not $text.Contains($scriptAnchor)) {
+    Write-Host 'Could not find client JS insertion point.'
+    exit 1
 }
+$text = $text.Replace($scriptAnchor, $clientJs + "`n" + 'hbLoadChatStatus();' + "`n" + $scriptAnchor)
 
 Set-Content -Path $HomeBasePath -Value $text -Encoding UTF8
-Write-Host 'Injected native HomeBase 8080 AI chat into homebase.ps1.'
+Write-Host 'Forced native HomeBase 8080 AI chat into homebase.ps1 and removed old iframe chat.'
