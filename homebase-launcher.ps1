@@ -1,11 +1,10 @@
-# AtoMind Home Base - one-click launcher (v0.6.5)
+# AtoMind Home Base - one-click launcher (v0.6.8.8)
 # Starts the bridge if it isn't running, then opens Home Base in an Edge --app window.
 # Idempotent: safe to run any number of times. Writes diagnostics to homebase-launcher.log.
 #
-# v0.6.5 absorbs the Endless Dungeon 'Door Opening' pattern: every click
-# gets instant visual feedback. A WPF splash window appears immediately so
-# the operator never wonders if the click registered. Status updates per
-# phase; splash closes when the cockpit opens (or before any error popup).
+# v0.6.8.8: the splash launcher now applies the native chat patcher before boot
+# and restarts stale HomeBase processes so the in-memory app cannot keep serving
+# old chat JavaScript / old /api/chat backend code.
 
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -15,8 +14,9 @@ $healthUrl = "http://localhost:$port/api/health/snapshot"
 
 $repo = $PSScriptRoot
 if (-not $repo) { $repo = Split-Path -Parent $MyInvocation.MyCommand.Path }
-$bridgePs1 = Join-Path $repo 'homebase.ps1'
-$logFile   = Join-Path $repo 'homebase-launcher.log'
+$bridgePs1  = Join-Path $repo 'homebase.ps1'
+$patcherPs1 = Join-Path $repo 'tools\ensure-in-cockpit-chat.ps1'
+$logFile    = Join-Path $repo 'homebase-launcher.log'
 
 function Write-LauncherLog {
   param([string]$Message)
@@ -27,9 +27,6 @@ function Write-LauncherLog {
 }
 
 # ---- Splash window (instant click feedback) -------------------------------
-# Runs in a background STA runspace so its WPF dispatcher doesn't get blocked
-# by the main script's port checks and polling loop. Main script communicates
-# via a synchronized hashtable polled by a DispatcherTimer on the splash side.
 $script:splashState = $null
 $script:splashRunspace = $null
 $script:splashPS = $null
@@ -78,7 +75,7 @@ function Start-Splash {
         <TextBlock x:Name="StatusText" Text="Starting..."
                    Foreground="#C0C0E0" HorizontalAlignment="Center"
                    FontFamily="Segoe UI" FontSize="12" Margin="0,14,0,0"/>
-        <TextBlock Text="v0.6.5 - absorbs everything it contacts"
+        <TextBlock Text="v0.6.8.8 - stable native chat boot"
                    Foreground="#606080" FontSize="10"
                    HorizontalAlignment="Center" Margin="0,10,0,0"
                    FontStyle="Italic"/>
@@ -132,19 +129,17 @@ function Show-LauncherMessage {
   Close-Splash
   try {
     $sh = New-Object -ComObject WScript.Shell
-    [void]$sh.Popup($Message, 0, $Title, 0x30) # 0x30 = warning icon, OK button
+    [void]$sh.Popup($Message, 0, $Title, 0x30)
   } catch {
     Write-LauncherLog "Could not show MessageBox: $($_.Exception.Message)"
   }
 }
 
-# Show the splash IMMEDIATELY so the click feels responsive
 Start-Splash
 
 Write-LauncherLog '==== launcher start ===='
 Write-LauncherLog "repo=$repo"
 
-# Locate pwsh.exe explicitly (don't rely on PATH inheritance from the shortcut)
 Set-SplashStatus 'Locating PowerShell 7...'
 $pwshCmd  = Get-Command pwsh.exe -ErrorAction SilentlyContinue
 $pwshPath = if ($pwshCmd) { $pwshCmd.Source } else { "$env:ProgramFiles\PowerShell\7\pwsh.exe" }
@@ -155,7 +150,6 @@ if (-not (Test-Path $pwshPath)) {
 }
 Write-LauncherLog "pwsh=$pwshPath"
 
-# Locate Microsoft Edge
 Set-SplashStatus 'Locating Microsoft Edge...'
 $edgeCandidates = @(
   "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
@@ -166,8 +160,6 @@ $edge = $edgeCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Objec
 Write-LauncherLog "edge=$edge"
 
 function Test-BridgeReady {
-  # Hit /api/health/snapshot first (proves the app is actually responding).
-  # Fall back to the root URL for older bridge versions that don't have the endpoint yet.
   try {
     $null = Invoke-WebRequest -Uri $healthUrl -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
     return $true
@@ -188,8 +180,6 @@ function Test-PortListening {
 }
 
 function Stop-StaleBridgeProcesses {
-  # Only kill pwsh/powershell whose command line includes homebase.ps1.
-  # This avoids nuking unrelated PowerShell sessions the operator may have open.
   try {
     $stale = Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction SilentlyContinue |
              Where-Object { $_.CommandLine -and ($_.CommandLine -match 'homebase\.ps1') -and ($_.ProcessId -ne $PID) }
@@ -209,12 +199,30 @@ function Start-Bridge {
     return $false
   }
   Write-LauncherLog "starting bridge: $pwshPath -File $bridgePs1"
-  # Visible window so startup errors are on screen if anything goes wrong.
   Start-Process -FilePath $pwshPath -ArgumentList @(
     '-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File', $bridgePs1
   ) -WindowStyle Normal | Out-Null
   return $true
 }
+
+# Critical v0.6.8.8 step: the desktop shortcut points at this splash launcher,
+# not launch-homebase.ps1. Apply the native chat patch here too, then restart
+# HomeBase so the fixed file is the running in-memory server.
+Set-SplashStatus 'Applying native chat patch...'
+if (Test-Path $patcherPs1) {
+  try {
+    $patchOutput = (& $pwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -File $patcherPs1 2>&1) -join "`n"
+    Write-LauncherLog "chat patcher output: $patchOutput"
+  } catch {
+    Write-LauncherLog "chat patcher failed: $($_.Exception.Message)"
+  }
+} else {
+  Write-LauncherLog "chat patcher not found at $patcherPs1"
+}
+
+Set-SplashStatus 'Restarting bridge with patched code...'
+Stop-StaleBridgeProcesses
+Start-Sleep -Seconds 1
 
 Set-SplashStatus 'Checking if bridge is already running...'
 $ready = Test-BridgeReady
@@ -225,8 +233,6 @@ if (-not $ready) {
   Write-LauncherLog "port $port busy=$portBusy (bridge not ready)"
 
   if ($portBusy) {
-    # Something is on the port but it's not answering /api/health/snapshot or /.
-    # Almost certainly a stale homebase.ps1. Kill and restart.
     Set-SplashStatus 'Clearing stale bridge processes...'
     Stop-StaleBridgeProcesses
     Start-Sleep -Seconds 1
@@ -235,7 +241,6 @@ if (-not $ready) {
   Set-SplashStatus 'Starting bridge...'
   if (-not (Start-Bridge)) { Close-Splash; exit 1 }
 
-  # Poll up to 60s (Notion API auth handshake can take 10-20s on a cold start)
   for ($i = 0; $i -lt 120; $i++) {
     Start-Sleep -Milliseconds 500
     if ($i -gt 0 -and ($i % 4) -eq 0) {
@@ -258,7 +263,6 @@ if ($ready) {
     Write-LauncherLog 'Edge not found, falling back to default browser'
     Start-Process $rootUrl | Out-Null
   }
-  # Give Edge a moment to take focus, then close splash
   Start-Sleep -Milliseconds 600
   Close-Splash
 } else {
