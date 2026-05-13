@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HomeBase Chat Turn",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "ts": { "type": "string" },
+    "session_id": { "type": "string" },
+    "user_id": { "type": "string" },
+    "provider": { "type": "string" },
+    "model": { "type": "string" },
+    "message_snippet": { "type": "string" },
+    "reply_snippet": { "type": "string" },
+    "proposals_count": { "type": "integer", "minimum": 0 },
+    "proposals": { "type": "array", "items": { "$ref": "command_proposal.json" } },
+    "context_sources": { "type": "array", "items": { "type": "string" } },
+    "writes": { "type": "integer", "const": 0 }
+  },
+  "required": ["ts", "session_id", "user_id", "provider", "model", "message_snippet", "reply_snippet", "proposals_count", "context_sources", "writes"]
+}

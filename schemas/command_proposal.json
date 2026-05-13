@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HomeBase Command Proposal",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "proposal_id": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1 },
+    "intent": { "type": "string", "minLength": 1 },
+    "writes_intent": { "type": "integer", "minimum": 0 },
+    "risk_level": { "type": "string", "enum": ["low", "medium", "high"] },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "type": { "type": "string" },
+          "payload": { "type": "object" }
+        },
+        "required": ["type", "payload"]
+      }
+    },
+    "explanation": { "type": "string" },
+    "blocked_reason": { "type": ["string", "null"] }
+  },
+  "required": ["proposal_id", "summary", "intent", "writes_intent", "risk_level", "commands", "explanation"]
+}
