@@ -1,4 +1,4 @@
-# AtomArcade — single-click launcher
+# AtoMind — single-click launcher
 # If Home Base isn't running, start it. Then open the dashboard in the default browser.
 # Used by the desktop shortcut created by install-shortcut.ps1.
 
@@ -18,7 +18,7 @@ function Test-HomeBaseUp {
 if (-not (Test-Path $Script)) {
     [System.Windows.Forms.MessageBox]::Show(
         "Couldn't find homebase.ps1 next to this launcher.`n`nExpected: $Script",
-        'AtomArcade Home Base', 'OK', 'Error'
+        'AtoMind Home Base', 'OK', 'Error'
     ) | Out-Null
     exit 1
 }
