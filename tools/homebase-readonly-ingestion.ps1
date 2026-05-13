@@ -141,7 +141,8 @@ function Convert-MarkdownTitleToPlain {
     $s = $s -replace "^- \[[ xX]\]\s*", ""
     $s = $s -replace "^\d+\.\s*", ""
     $s = $s -replace "\*\*", ""
-    $s = $s -replace "`", ""
+    # Avoid PowerShell parser ambiguity around a literal backtick in quoted strings.
+    $s = $s.Replace([string][char]96, "")
     $s = $s -replace "\s+", " "
     return $s.Trim()
 }
