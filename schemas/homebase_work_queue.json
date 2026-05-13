@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atomeam.local/schemas/homebase_work_queue.json",
+  "title": "HomeBaseWorkQueue",
+  "type": "object",
+  "required": [
+    "ok",
+    "command",
+    "mode",
+    "source_page_id",
+    "object_type",
+    "lanes",
+    "item_count",
+    "items",
+    "default_rule",
+    "stop_conditions",
+    "writes"
+  ],
+  "properties": {
+    "ok": { "type": "boolean" },
+    "command": { "const": "INGEST_KEEP_COUNCIL_BUSY" },
+    "mode": { "const": "read_only" },
+    "source_page_id": { "type": "string" },
+    "object_type": { "const": "HomeBaseWorkQueue" },
+    "lanes": {
+      "type": "object",
+      "required": ["ai-only", "mcp-lane", "human-only"],
+      "properties": {
+        "ai-only": { "type": "integer", "minimum": 0 },
+        "mcp-lane": { "type": "integer", "minimum": 0 },
+        "human-only": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "item_count": { "type": "integer", "minimum": 0 },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "payload", "priority", "created_at", "status", "writes"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "enum": ["ai-only", "mcp-lane", "human-only"] },
+          "payload": { "type": "object" },
+          "priority": { "type": "integer" },
+          "created_at": { "type": "string" },
+          "status": { "enum": ["pending", "done"] },
+          "stop_condition": { "type": ["string", "null"] },
+          "default_rule": { "type": ["string", "null"] },
+          "writes": { "const": 0 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "default_rule": { "type": ["string", "null"] },
+    "stop_conditions": { "type": "array", "items": { "type": "string" } },
+    "missing_fields": { "type": "array", "items": { "type": "string" } },
+    "writes": { "const": 0 }
+  },
+  "additionalProperties": true
+}
