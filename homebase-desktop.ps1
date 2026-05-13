@@ -1,5 +1,5 @@
 # ============================================================
-# AtomArcade Home Base — Desktop Launcher (v0.5.1)
+# AtoMind Home Base — Desktop Launcher (v0.5.1)
 # ============================================================
 # Starts the browser Automation Center in homebase.ps1 when needed, then opens
 # http://localhost:8080/ in the default browser.
@@ -29,7 +29,7 @@ function Show-ErrorMessage {
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.MessageBox]::Show(
             $Message,
-            'AtomArcade Home Base',
+            'AtoMind Home Base',
             'OK',
             'Error'
         ) | Out-Null
