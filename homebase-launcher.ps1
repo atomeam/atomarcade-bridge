@@ -1,10 +1,12 @@
-# AtoMind Home Base - one-click launcher (v0.6.8.8)
+# AtoMind Home Base - one-click launcher (v0.6.8.9)
 # Starts the bridge if it isn't running, then opens Home Base in an Edge --app window.
 # Idempotent: safe to run any number of times. Writes diagnostics to homebase-launcher.log.
 #
-# v0.6.8.8: the splash launcher now applies the native chat patcher before boot
-# and restarts stale HomeBase processes so the in-memory app cannot keep serving
-# old chat JavaScript / old /api/chat backend code.
+# v0.6.8.9: applies the integrated chat patcher before boot:
+# - native AI chat on the main 8080 cockpit
+# - VIKTOR command target + VIKTOR cockpit chat/proxy
+# Then restarts stale HomeBase processes so the in-memory app cannot keep serving
+# old JavaScript or old API route code.
 
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -15,7 +17,7 @@ $healthUrl = "http://localhost:$port/api/health/snapshot"
 $repo = $PSScriptRoot
 if (-not $repo) { $repo = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $bridgePs1  = Join-Path $repo 'homebase.ps1'
-$patcherPs1 = Join-Path $repo 'tools\ensure-in-cockpit-chat.ps1'
+$patcherPs1 = Join-Path $repo 'tools\ensure-homebase-integrated-chats.ps1'
 $logFile    = Join-Path $repo 'homebase-launcher.log'
 
 function Write-LauncherLog {
@@ -75,7 +77,7 @@ function Start-Splash {
         <TextBlock x:Name="StatusText" Text="Starting..."
                    Foreground="#C0C0E0" HorizontalAlignment="Center"
                    FontFamily="Segoe UI" FontSize="12" Margin="0,14,0,0"/>
-        <TextBlock Text="v0.6.8.8 - stable native chat boot"
+        <TextBlock Text="v0.6.8.9 - integrated chats boot"
                    Foreground="#606080" FontSize="10"
                    HorizontalAlignment="Center" Margin="0,10,0,0"
                    FontStyle="Italic"/>
@@ -205,19 +207,23 @@ function Start-Bridge {
   return $true
 }
 
-# Critical v0.6.8.8 step: the desktop shortcut points at this splash launcher,
-# not launch-homebase.ps1. Apply the native chat patch here too, then restart
-# HomeBase so the fixed file is the running in-memory server.
-Set-SplashStatus 'Applying native chat patch...'
+# Critical step: the desktop shortcut points at this splash launcher. Apply the
+# integrated chat patch here so localhost:8080 always gets both native AI chat
+# and VIKTOR chat/proxy before the bridge boots.
+Set-SplashStatus 'Applying integrated chat patches...'
 if (Test-Path $patcherPs1) {
   try {
     $patchOutput = (& $pwshPath -NoLogo -NoProfile -ExecutionPolicy Bypass -File $patcherPs1 2>&1) -join "`n"
-    Write-LauncherLog "chat patcher output: $patchOutput"
+    Write-LauncherLog "integrated chat patcher output: $patchOutput"
   } catch {
-    Write-LauncherLog "chat patcher failed: $($_.Exception.Message)"
+    Write-LauncherLog "integrated chat patcher failed: $($_.Exception.Message)"
+    Show-LauncherMessage 'Home Base launcher' "Integrated chat patch failed:`n$($_.Exception.Message)`n`nDiagnostic log:`n$logFile"
+    exit 1
   }
 } else {
-  Write-LauncherLog "chat patcher not found at $patcherPs1"
+  Write-LauncherLog "integrated chat patcher not found at $patcherPs1"
+  Show-LauncherMessage 'Home Base launcher' "Integrated chat patcher not found at:`n$patcherPs1"
+  exit 1
 }
 
 Set-SplashStatus 'Restarting bridge with patched code...'
