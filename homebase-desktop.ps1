@@ -1,22 +1,18 @@
 # ============================================================
-# AtoMind Home Base — Desktop Launcher (v0.6.8.2)
+# AtoMind HomeBase — Desktop Launcher (v0.6.8.6)
 # ============================================================
-# Starts the browser Automation Center in homebase.ps1 and the AI Chat Runtime
-# sidecar when needed, then opens both local app surfaces.
-# v0.6.8.2 also ensures the main cockpit embeds the chat panel.
+# Single-app launch: starts only the main HomeBase cockpit on localhost:8080.
+# Native AI chat is injected into homebase.ps1 and served from the same app.
+# No iframe sidecar and no automatic localhost:8081 window.
 # ============================================================
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$Version = 'v0.6.8.2-in-cockpit-chat-launcher'
+$Version = 'v0.6.8.6-single-app-native-chat'
 $Port    = 8080
-$ChatPort = if ($env:HB_CHAT_PORT) { [int]$env:HB_CHAT_PORT } else { 8081 }
 $Url     = "http://localhost:$Port/"
-$HealthUrl = "${Url}api/soak/status"
-$ChatUrl = "http://localhost:$ChatPort/"
-$ChatHealthUrl = "${ChatUrl}api/chat/status"
+$HealthUrl = "${Url}api/status"
 $Script  = Join-Path $PSScriptRoot 'homebase.ps1'
-$ChatScript = Join-Path $PSScriptRoot 'tools\homebase-ai-chat-runtime.ps1'
 $EmbedScript = Join-Path $PSScriptRoot 'tools\ensure-in-cockpit-chat.ps1'
 
 function Test-EndpointUp {
@@ -29,6 +25,15 @@ function Test-EndpointUp {
     }
 }
 
+function Stop-PortListener {
+    param([int]$LocalPort)
+    try {
+        Get-NetTCPConnection -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty OwningProcess -Unique |
+            ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+    } catch {}
+}
+
 function Show-ErrorMessage {
     param([string]$Message)
 
@@ -36,7 +41,7 @@ function Show-ErrorMessage {
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.MessageBox]::Show(
             $Message,
-            'AtoMind Home Base',
+            'AtoMind HomeBase',
             'OK',
             'Error'
         ) | Out-Null
@@ -68,36 +73,26 @@ if (-not (Test-Path $Script)) {
     exit 1
 }
 
-# v0.6.8.2: ensure the main 8080 cockpit contains the embedded 8081 AI chat card.
-# Idempotent; only modifies local homebase.ps1 if the card is missing.
+# Ensure native chat is injected into the 8080 cockpit before boot.
 if (Test-Path $EmbedScript) {
     & $EmbedScript | Out-Null
 }
 
-if (-not (Test-EndpointUp $HealthUrl)) {
-    Start-PwshScript -Path $Script
+# Force restart the main app so the patched dashboard is loaded into memory.
+Stop-PortListener -LocalPort $Port
+Start-Sleep -Milliseconds 500
 
-    for ($i = 0; $i -lt 30; $i++) {
-        Start-Sleep -Milliseconds 500
-        if (Test-EndpointUp $HealthUrl) { break }
-    }
-}
-
-if ((Test-Path $ChatScript) -and -not (Test-EndpointUp $ChatHealthUrl)) {
-    Start-PwshScript -Path $ChatScript
-
-    for ($i = 0; $i -lt 30; $i++) {
-        Start-Sleep -Milliseconds 500
-        if (Test-EndpointUp $ChatHealthUrl) { break }
-    }
+Start-PwshScript -Path $Script
+for ($i = 0; $i -lt 30; $i++) {
+    Start-Sleep -Milliseconds 500
+    if (Test-EndpointUp $HealthUrl) { break }
 }
 
 Start-Process $Url
-Start-Process $ChatUrl
 
 if (Test-EndpointUp $HealthUrl) {
     exit 0
 }
 
-Show-ErrorMessage "Home Base browser was opened, but the local server did not answer $HealthUrl yet.`n`nIf the browser does not load after a refresh, run manually:`n`npwsh -File `"$Script`""
+Show-ErrorMessage "HomeBase was opened, but the local server did not answer $HealthUrl yet.`n`nIf the browser does not load after a refresh, run manually:`n`npwsh -File `"$Script`""
 exit 1
