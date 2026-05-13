@@ -1,21 +1,26 @@
 # ============================================================
-# AtoMind Home Base — Desktop Launcher (v0.5.1)
+# AtoMind Home Base — Desktop Launcher (v0.6.8.1)
 # ============================================================
-# Starts the browser Automation Center in homebase.ps1 when needed, then opens
-# http://localhost:8080/ in the default browser.
+# Starts the browser Automation Center in homebase.ps1 and the AI Chat Runtime
+# sidecar when needed, then opens both local app surfaces.
 # ============================================================
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$Version = 'v0.5.1-desktop-launcher'
+$Version = 'v0.6.8.1-integrated-chat-launcher'
 $Port    = 8080
+$ChatPort = if ($env:HB_CHAT_PORT) { [int]$env:HB_CHAT_PORT } else { 8081 }
 $Url     = "http://localhost:$Port/"
 $HealthUrl = "${Url}api/soak/status"
+$ChatUrl = "http://localhost:$ChatPort/"
+$ChatHealthUrl = "${ChatUrl}api/chat/status"
 $Script  = Join-Path $PSScriptRoot 'homebase.ps1'
+$ChatScript = Join-Path $PSScriptRoot 'tools\homebase-ai-chat-runtime.ps1'
 
-function Test-HomeBaseUp {
+function Test-EndpointUp {
+    param([string]$Endpoint)
     try {
-        $r = Invoke-WebRequest -Uri $HealthUrl -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
+        $r = Invoke-WebRequest -Uri $Endpoint -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop
         return ($r.StatusCode -eq 200)
     } catch {
         return $false
@@ -38,12 +43,8 @@ function Show-ErrorMessage {
     }
 }
 
-if (-not (Test-Path $Script)) {
-    Show-ErrorMessage "Could not find homebase.ps1 next to this launcher.`n`nExpected: $Script"
-    exit 1
-}
-
-if (-not (Test-HomeBaseUp)) {
+function Start-PwshScript {
+    param([string]$Path)
     $pwsh = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
     if (-not $pwsh) {
         $pwsh = (Get-Command powershell -ErrorAction SilentlyContinue).Source
@@ -55,22 +56,38 @@ if (-not (Test-HomeBaseUp)) {
     }
 
     Start-Process -FilePath $pwsh `
-        -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File', $Script) `
+        -ArgumentList @('-NoLogo','-NoProfile','-ExecutionPolicy','Bypass','-File', $Path) `
         -WorkingDirectory $PSScriptRoot `
         -WindowStyle Minimized
+}
 
-    # Wait up to 15 seconds for the listener to bind.
+if (-not (Test-Path $Script)) {
+    Show-ErrorMessage "Could not find homebase.ps1 next to this launcher.`n`nExpected: $Script"
+    exit 1
+}
+
+if (-not (Test-EndpointUp $HealthUrl)) {
+    Start-PwshScript -Path $Script
+
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 500
-        if (Test-HomeBaseUp) { break }
+        if (Test-EndpointUp $HealthUrl) { break }
     }
 }
 
-# Always try to open the browser, even if the health endpoint did not answer.
-# If the server is still booting, the browser can be refreshed manually.
-Start-Process $Url
+if ((Test-Path $ChatScript) -and -not (Test-EndpointUp $ChatHealthUrl)) {
+    Start-PwshScript -Path $ChatScript
 
-if (Test-HomeBaseUp) {
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (Test-EndpointUp $ChatHealthUrl) { break }
+    }
+}
+
+Start-Process $Url
+Start-Process $ChatUrl
+
+if (Test-EndpointUp $HealthUrl) {
     exit 0
 }
 
