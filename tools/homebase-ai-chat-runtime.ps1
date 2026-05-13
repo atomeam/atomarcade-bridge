@@ -1,4 +1,4 @@
-# HomeBase AI Chat Runtime v0.1.1
+# HomeBase AI Chat Runtime v0.1.2
 # Purpose: sidecar chat endpoint for HomeBase. Proposal-first. No autonomous writes.
 # Run: pwsh -File .\tools\homebase-ai-chat-runtime.ps1
 
@@ -17,9 +17,7 @@ $AuditLog = if ($env:HB_CHAT_AUDIT_LOG_PATH) { $env:HB_CHAT_AUDIT_LOG_PATH } els
 $MaxContextChars = if ($env:HB_CHAT_MAX_CONTEXT_CHARS) { [int]$env:HB_CHAT_MAX_CONTEXT_CHARS } else { 12000 }
 $StrictSafety = ($env:HB_CHAT_STRICT_SAFETY -eq '1')
 
-# v0.1 was too aggressive: it blocked normal operational replies whenever the model
-# mentioned words like token, billing, domain, or delete. v0.1.1 keeps hard blocks for
-# explicit dangerous operator requests, but lets the AI respond normally with guardrails.
+# Hard blocks only for explicit dangerous operator requests. Normal operational discussion is allowed.
 $CriticalInputBlockedPatterns = @(
     '(?i)\b(show|print|dump|reveal|exfiltrate|send|copy)\b.*\b(secret|token|api[_ -]?key|password|credential)\b',
     '(?i)\b(delete|drop table|rm\s+-rf|format|wipe|destroy)\b.*\b(now|immediately|without approval|autonomously)\b',
@@ -116,7 +114,7 @@ function New-DryRunReply {
         explanation = 'Dry-run provider is enabled, so this is a proposal-only mock response. No writes were performed.'
         blocked_reason = $null
     }
-    return @{ reply = "HomeBase chat runtime is online in dry-run mode. I can see context sources: $($Context.sources -join ', '). I will propose actions only; I will not write without approval."; proposals = @($proposal); safety_notes=@() }
+    return @{ reply = "HomeBase chat runtime is online in dry-run mode. You said: $Message`n`nI can see context sources: $($Context.sources -join ', '). I can answer freely here and propose actions, but I will not execute writes automatically."; proposals = @($proposal); safety_notes=@() }
 }
 
 function Invoke-OpenAICompatibleChat {
@@ -124,10 +122,11 @@ function Invoke-OpenAICompatibleChat {
     if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw 'HB_AI_API_KEY or LLM_API_KEY is not set. Use dry-run provider or set an API key.' }
 
     $system = @"
-You are HomeBase AI Chat Runtime v0.1.1 inside Atom's cockpit.
+You are HomeBase AI Chat Runtime v0.1.2 inside Atom's cockpit.
 Use the provided HomeBase context to answer and help operate HomeBase.
 Operating rules:
-- You may answer operational questions directly.
+- This is a free-form chat interface. Answer the operator's actual message, not only the default/pinned prompt.
+- You may answer operational questions directly and conversationally.
 - You may propose concrete next actions.
 - Do not claim an action was executed unless the operator shows execution output.
 - Do not expose secrets, tokens, API keys, passwords, or credentials.
@@ -141,7 +140,7 @@ $($Context.text)
 
     $body = @{
         model = $Model
-        temperature = 0.1
+        temperature = 0.2
         messages = @(
             @{ role = 'system'; content = $system },
             @{ role = 'user'; content = $Message }
@@ -214,16 +213,27 @@ function Read-JsonBody {
 
 $ChatHtml = @'
 <!doctype html><html><head><meta charset="utf-8"><title>HomeBase AI Chat</title><style>
-body{font-family:ui-monospace,Consolas,monospace;background:#0b0d10;color:#e6e6e6;margin:0;padding:22px}textarea{width:100%;height:90px;background:#13171c;color:#e6e6e6;border:1px solid #26313d;border-radius:8px;padding:10px}button{background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:8px 12px;margin-top:8px}pre{white-space:pre-wrap;background:#13171c;border:1px solid #26313d;border-radius:8px;padding:12px}.prop{border:1px solid #8a6d00;background:#2a2207;border-radius:8px;padding:10px;margin-top:8px}.muted{color:#8b949e;font-size:12px}</style></head><body>
-<h1>HomeBase AI Chat Runtime v0.1.1</h1><p>Open operational chat. Proposal-first. No autonomous writes.</p><textarea id="msg">What should we do next for HomeBase migration?</textarea><br><button onclick="send()">Send</button><pre id="reply">Ready.</pre><div id="meta" class="muted"></div><div id="props"></div><script>
-async function send(){document.getElementById('reply').textContent='Thinking...';const message=document.getElementById('msg').value;const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,user_id:'atom',session_id:'homebase-ui'})});const j=await r.json();document.getElementById('reply').textContent=j.reply||JSON.stringify(j,null,2);document.getElementById('meta').textContent=j.meta?('provider='+j.meta.provider+' model='+j.meta.model+' writes='+j.meta.writes+' strict='+j.meta.strict_safety):'';document.getElementById('props').innerHTML=(j.proposals||[]).map(p=>'<div class="prop"><b>'+p.summary+'</b><br>risk: '+p.risk_level+' | writes_intent: '+p.writes_intent+'<br><pre>'+JSON.stringify(p,null,2)+'</pre><button disabled title="v0.1.1 proposal only">Create command row (disabled)</button></div>').join('')}
+:root{color-scheme:dark}*{box-sizing:border-box}body{font-family:ui-monospace,Consolas,monospace;background:#0b0d10;color:#e6e6e6;margin:0;padding:16px}.wrap{max-width:1000px;margin:0 auto}.top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}h1{font-size:18px;margin:0}.muted{color:#8b949e;font-size:12px}.chat{display:flex;flex-direction:column;gap:10px;min-height:280px;max-height:480px;overflow:auto;background:#090c10;border:1px solid #26313d;border-radius:10px;padding:12px}.msg{border:1px solid #26313d;border-radius:10px;padding:10px;white-space:pre-wrap}.user{background:#13233a;border-color:#1f6feb}.ai{background:#13171c}.sys{background:#1b1308;border-color:#8a6d00}.composer{display:flex;gap:8px;margin-top:10px;align-items:flex-end}textarea{flex:1;min-height:72px;max-height:180px;background:#13171c;color:#e6e6e6;border:1px solid #26313d;border-radius:8px;padding:10px;font-family:inherit}button{background:#1f6feb;color:#fff;border:0;border-radius:6px;padding:9px 12px;cursor:pointer}button:hover{background:#388bfd}.small{font-size:11px}.prop{border:1px solid #8a6d00;background:#2a2207;border-radius:8px;padding:10px;margin-top:8px}pre{white-space:pre-wrap;overflow:auto}.quick{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}.quick button{background:#21262d;color:#c9d1d9;padding:5px 8px;font-size:11px}</style></head><body><div class="wrap">
+<div class="top"><div><h1>HomeBase AI Chat Runtime v0.1.2</h1><div class="muted">Free-form chat. Proposal-first. No autonomous writes.</div></div><div id="status" class="muted">checking...</div></div>
+<div class="quick"><button onclick="seed('What is the current HomeBase state?')">State</button><button onclick="seed('What should we do next?')">Next</button><button onclick="seed('Help me debug the current blocker.')">Debug</button><button onclick="seed('List 5 safe AI-only migration actions.')">AI queue</button></div>
+<div id="chat" class="chat"><div class="msg sys">Ready. Type anything below. Shift+Enter = new line. Enter = send.</div></div>
+<div class="composer"><textarea id="msg" placeholder="Talk to HomeBase freely..."></textarea><button id="sendBtn" onclick="send()">Send</button></div>
+<div id="props"></div>
+</div><script>
+const chat=document.getElementById('chat');const msg=document.getElementById('msg');const statusEl=document.getElementById('status');
+function add(cls,text){const d=document.createElement('div');d.className='msg '+cls;d.textContent=text;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d}
+function seed(t){msg.value=t;msg.focus()}
+msg.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}})
+async function loadStatus(){try{const r=await fetch('/api/chat/status');const j=await r.json();statusEl.textContent='provider='+j.provider+' model='+j.model+' writes='+j.writes+' version='+(j.version||'v0.1')}catch(e){statusEl.textContent='status unavailable'}}
+async function send(){const message=msg.value.trim();if(!message)return;msg.value='';add('user',message);const holder=add('ai','Thinking...');document.getElementById('sendBtn').disabled=true;try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,user_id:'atom',session_id:'homebase-ui'})});const j=await r.json();holder.textContent=j.reply||JSON.stringify(j,null,2);document.getElementById('props').innerHTML=(j.proposals||[]).map(p=>'<div class="prop"><b>'+p.summary+'</b><br>risk: '+p.risk_level+' | writes_intent: '+p.writes_intent+'<br><pre>'+JSON.stringify(p,null,2)+'</pre><button disabled title="proposal only">Create command row (disabled)</button></div>').join('');if(j.meta){statusEl.textContent='provider='+j.meta.provider+' model='+j.meta.model+' writes='+j.meta.writes+' strict='+j.meta.strict_safety}}catch(e){holder.textContent='Error: '+e.message}finally{document.getElementById('sendBtn').disabled=false;msg.focus()}}
+loadStatus();msg.focus();
 </script></body></html>
 '@
 
 $listener = [Net.HttpListener]::new()
 $listener.Prefixes.Add("http://localhost:$Port/")
 $listener.Start()
-Write-Host "HomeBase AI Chat Runtime v0.1.1 listening on http://localhost:$Port/"
+Write-Host "HomeBase AI Chat Runtime v0.1.2 listening on http://localhost:$Port/"
 Write-Host "Provider=$Provider Model=$Model AuditLog=$AuditLog StrictSafety=$StrictSafety"
 try {
     while ($listener.IsListening) {
@@ -232,7 +242,7 @@ try {
         $method = $ctx.Request.HttpMethod
         try {
             if ($method -eq 'GET' -and $path -eq '/') { Write-TextResponse -Context $ctx -Text $ChatHtml }
-            elseif ($method -eq 'GET' -and $path -eq '/api/chat/status') { Write-JsonResponse -Context $ctx -Object @{ ok=$true; provider=$Provider; model=$Model; port=$Port; audit_log=$AuditLog; writes=0; strict_safety=$StrictSafety; version='v0.1.1' } }
+            elseif ($method -eq 'GET' -and $path -eq '/api/chat/status') { Write-JsonResponse -Context $ctx -Object @{ ok=$true; provider=$Provider; model=$Model; port=$Port; audit_log=$AuditLog; writes=0; strict_safety=$StrictSafety; version='v0.1.2' } }
             elseif ($method -eq 'POST' -and $path -eq '/api/chat') { $body = Read-JsonBody $ctx; Write-JsonResponse -Context $ctx -Object (Invoke-HomeBaseChat -Body $body) }
             else { Write-JsonResponse -Context $ctx -Status 404 -Object @{ ok=$false; error='not found'; path=$path } }
         } catch { Write-JsonResponse -Context $ctx -Status 500 -Object @{ ok=$false; error=$_.Exception.Message } }
