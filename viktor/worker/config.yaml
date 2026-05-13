@@ -1,0 +1,28 @@
+# Local VIKTOR worker config template for HomeBase.
+# Put/copy this next to the actual VIKTOR Generic worker executable if you use VIKTOR's worker service.
+# Restart the worker after edits.
+
+executables:
+  python_script:
+    path: 'C:\Program Files\PowerShell\7\pwsh.exe'
+    arguments:
+      - '-NoLogo'
+      - '-NoProfile'
+      - '-ExecutionPolicy'
+      - 'Bypass'
+      - '-File'
+      - 'C:\AtomArcade\atomarcade-bridge\handlers\run-viktor-task.ps1'
+    workingDirectoryPath: 'C:\AtomArcade\atomarcade-bridge\viktor\scripts'
+
+  homebase_viktor_smoke:
+    path: 'C:\Program Files\PowerShell\7\pwsh.exe'
+    arguments:
+      - '-NoLogo'
+      - '-NoProfile'
+      - '-ExecutionPolicy'
+      - 'Bypass'
+      - '-File'
+      - 'C:\AtomArcade\atomarcade-bridge\viktor\scripts\test.py'
+    workingDirectoryPath: 'C:\AtomArcade\atomarcade-bridge\viktor\scripts'
+
+maxParallelProcesses: 1
