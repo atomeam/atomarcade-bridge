@@ -1,5 +1,5 @@
 #Requires -Version 5.0
-# Homebase Button installer
+# Homebase installer — launches the Homebase web app (atomeam/HomeBase-)
 # Usage:
 #   iex (irm https://raw.githubusercontent.com/atomeam/atomarcade-bridge/homebase-button/apps/homebase-button/install.ps1)
 
@@ -7,50 +7,44 @@
 param()
 
 $ErrorActionPreference = 'Stop'
-$AppName    = 'Homebase'
-$InstallDir = Join-Path $env:LOCALAPPDATA 'HomebaseButton'
-$RepoRaw    = 'https://raw.githubusercontent.com/atomeam/atomarcade-bridge/homebase-button/apps/homebase-button'
+$AppName = 'Homebase'
+$AppUrl  = 'https://ais-dev-67uj6cve22lq7ja6prfk25-310117696491.us-west1.run.app'
 
-Write-Host "Installing $AppName to $InstallDir ..." -ForegroundColor Cyan
-New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+Write-Host "Installing $AppName Desktop launcher..." -ForegroundColor Cyan
 
-# Download the app script from the repo
-$AppPath = Join-Path $InstallDir 'HomebaseButton.ps1'
-Invoke-WebRequest -Uri "$RepoRaw/HomebaseButton.ps1" -OutFile $AppPath -UseBasicParsing
+function New-UrlShortcut {
+    param([string]$Path, [string]$Url)
+    @"
+[InternetShortcut]
+URL=$Url
+IconIndex=0
+"@ | Set-Content -Path $Path -Encoding ASCII -Force
+}
 
-# Write a hidden-window launcher (.cmd)
-$LauncherPath  = Join-Path $InstallDir 'HomebaseButton.cmd'
-$LauncherLines = @(
-    '@echo off',
-    'powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0HomebaseButton.ps1"'
+# Clean up legacy .lnk shortcuts from the previous PowerShell WinForms version
+$Desktop     = [Environment]::GetFolderPath('Desktop')
+$StartMenu   = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'
+$LegacyPaths = @(
+    (Join-Path $Desktop   "$AppName.lnk"),
+    (Join-Path $StartMenu "$AppName.lnk")
 )
-Set-Content -Path $LauncherPath -Value $LauncherLines -Encoding ASCII
+foreach ($p in $LegacyPaths) {
+    if (Test-Path $p) {
+        Remove-Item $p -Force -ErrorAction SilentlyContinue
+        Write-Host "  Removed legacy shortcut: $p"
+    }
+}
 
-# Create Desktop + Start Menu shortcuts
-$WshShell = New-Object -ComObject WScript.Shell
-
-$DesktopLink = Join-Path ([Environment]::GetFolderPath('Desktop')) "$AppName.lnk"
-$sc1 = $WshShell.CreateShortcut($DesktopLink)
-$sc1.TargetPath       = $LauncherPath
-$sc1.WorkingDirectory = $InstallDir
-$sc1.IconLocation     = 'shell32.dll,77'
-$sc1.Description      = 'Homebase (button-only)'
-$sc1.Save()
-
-$StartMenuDir  = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs'
-$StartMenuLink = Join-Path $StartMenuDir "$AppName.lnk"
-$sc2 = $WshShell.CreateShortcut($StartMenuLink)
-$sc2.TargetPath       = $LauncherPath
-$sc2.WorkingDirectory = $InstallDir
-$sc2.IconLocation     = 'shell32.dll,77'
-$sc2.Description      = 'Homebase (button-only)'
-$sc2.Save()
+# Create new Internet Shortcuts pointing at the live web app
+$DesktopUrl   = Join-Path $Desktop   "$AppName.url"
+$StartMenuUrl = Join-Path $StartMenu "$AppName.url"
+New-UrlShortcut -Path $DesktopUrl   -Url $AppUrl
+New-UrlShortcut -Path $StartMenuUrl -Url $AppUrl
 
 Write-Host ""
-Write-Host "Homebase installed." -ForegroundColor Green
-Write-Host "  Install dir:   $InstallDir"
-Write-Host "  Desktop:       $DesktopLink"
-Write-Host "  Start Menu:    $StartMenuLink"
+Write-Host "$AppName installed." -ForegroundColor Green
+Write-Host "  Desktop:    $DesktopUrl"
+Write-Host "  Start Menu: $StartMenuUrl"
+Write-Host "  Target URL: $AppUrl"
 Write-Host ""
-Write-Host "Run via Desktop, Start Menu, or directly:"
-Write-Host "  $LauncherPath"
+Write-Host "Double-click '$AppName' on the Desktop to launch."
