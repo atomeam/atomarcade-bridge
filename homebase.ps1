@@ -1,4 +1,4 @@
-# AtomArcade Home Base — v0.6.2
+# AtomArcade Home Base — v0.6.3-log-db-fallback
 # Single-file PowerShell HTTP server + Notion Command Bus + write-capable Automation Center.
 # Run with: pwsh -File homebase.ps1
 # Requires: PowerShell 7+, Windows, RetroArch with network_cmd_enable = "true".
@@ -13,14 +13,19 @@ $RETROARCH_HOST  = '127.0.0.1'
 $RETROARCH_PORT  = 55355
 $UDP_TIMEOUT_MS  = 800
 $LOG_MAX         = 500
-$VERSION         = 'v0.6.2-chorus-hardening'
+$VERSION         = 'v0.6.3-log-db-fallback'
 $GOVERNANCE_HASH = 'curator-policy-v0.6'
 
 # --- Notion Command Bus ---
 $NOTION_TOKEN          = $env:ATOMARCADE_NOTION_TOKEN
 $NOTION_DATABASE_ID    = $env:ATOMARCADE_NOTION_DB_ID
 $NOTION_AUTO_DB_ID     = $env:ATOMARCADE_NOTION_AUTO_DB_ID
-$NOTION_LOG_DB_ID      = $env:ATOMARCADE_NOTION_LOG_DB_ID
+# v0.6.3: hardcoded fallback for the Logs DB UUID (workspace-public,
+# not a secret). Removes a class of operator error where the bridge
+# silently fails to log because ATOMARCADE_NOTION_LOG_DB_ID was never
+# set on the user environment. Env var still takes precedence when present.
+$NOTION_LOG_DB_ID_FALLBACK = '4ee3980e62fa4abea716c7d6656011ba'
+$NOTION_LOG_DB_ID      = if ([string]::IsNullOrWhiteSpace($env:ATOMARCADE_NOTION_LOG_DB_ID)) { $NOTION_LOG_DB_ID_FALLBACK } else { $env:ATOMARCADE_NOTION_LOG_DB_ID }
 $NOTION_POLL_SECONDS   = 5
 $NOTION_API_VERSION    = '2022-06-28'
 $NOTION_ENABLED        = -not [string]::IsNullOrWhiteSpace($NOTION_TOKEN) -and -not [string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)
