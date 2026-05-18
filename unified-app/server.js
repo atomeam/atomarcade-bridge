@@ -314,8 +314,8 @@ function logToFile(entry) {
   } catch (e) { console.error('Log error:', e.message); }
 }
 
-// Run full Alpha loop (must be before /:step)
-app.post('/api/run/alpha-loop', async (req, res) => {
+// Run full Alpha loop
+app.post('/api/alpha-loop', async (req, res) => {
   logToFile({ step: 'alpha-loop', status: 'running', message: 'Starting Alpha loop...' });
   
   const results = [];
@@ -354,8 +354,9 @@ app.post('/api/run/alpha-loop', async (req, res) => {
 // Run Alpha step
 app.post('/api/run/:step', async (req, res) => {
   const { step } = req.params;
+  
   if (!ALPHA_PROMPTS[step]) {
-    return res.json({ error: 'Unknown step', valid: Object.keys(ALPHA_PROMPTS) });
+    return res.json({ error: 'Unknown step', valid: Object.keys(ALPHA_PROMPTS), hint: 'Use POST /api/alpha-loop for full loop' });
   }
   
   logToFile({ step, status: 'running', message: `Running ${step}...` });
