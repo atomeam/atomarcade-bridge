@@ -76,8 +76,7 @@ Returns a structured health check of all dependencies. Each check runs in parall
 ```json
 {
   "ok": true,
-  "version": "1.0.0",
-  "versionMeta": {
+  "version": {
     "service": "atomarcade-bridge",
     "semver": "1.0.0",
     "gitSha": "a1b2c3d",
@@ -93,16 +92,15 @@ Returns a structured health check of all dependencies. Each check runs in parall
 }
 ```
 
-**Version Fields:**
+**Version Object Fields:**
 
 | Field | Description |
 |-------|-------------|
-| `version` | Semver string from package.json (backward compat) |
-| `versionMeta` | Full metadata object |
-| `versionMeta.service` | Always "atomarcade-bridge" |
-| `versionMeta.semver` | Version from package.json or fallback |
-| `versionMeta.gitSha` | Short git SHA or "unknown" |
-| `versionMeta.node` | Node.js version |
+| `version` | Full version object |
+| `version.service` | Always "atomarcade-bridge" |
+| `version.semver` | Version from package.json or fallback |
+| `version.gitSha` | Short git SHA or "unknown" |
+| `version.node` | Node.js version |
 
 **Interpreting Results:**
 

@@ -317,8 +317,7 @@ app.get("/api/health", async (req, res) => {
   
   res.json({
     ok,
-    version: version.semver,
-    versionMeta: version,
+    version: version,
     timestamp: new Date().toISOString(),
     checks
   });
