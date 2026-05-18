@@ -13,10 +13,57 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
-// Notion config
-const NOTION_KEY = process.env.NOTION_API_KEY || process.env.GEMINI_API_KEY;
+// Key validation at startup
+const KEYS = {
+  GEMINI: process.env.GEMINI_API_KEY,
+  NOTION: process.env.NOTION_API_KEY
+};
+
+const KEY_STATUS = {
+  GEMINI: KEYS.GEMINI ? 'loaded' : 'missing',
+  NOTION: KEYS.NOTION ? 'loaded' : 'missing',
+  checkedAt: new Date().toISOString()
+};
+
+console.log(`[Keys] GEMINI: ${KEY_STATUS.GEMINI}, NOTION: ${KEY_STATUS.NOTION}`);
+
+// Endpoint: Check key status
+app.get('/api/keys', (req, res) => {
+  res.json(KEY_STATUS);
+});
+
+// Endpoint: Test Gemini (simple call)
+app.get('/api/keys/gemini/test', async (req, res) => {
+  if (!KEYS.GEMINI) {
+    return res.json({ error: 'GEMINI_API_KEY not set', success: false });
+  }
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1/models?key=${KEYS.GEMINI}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    const ok = resp.ok && !data.error;
+    res.json({ success: ok, error: data.error, models: data.models?.length || 0 });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: Test Notion (ping)
+app.get('/api/keys/notion/test', async (req, res) => {
+  if (!KEYS.NOTION) {
+    return res.json({ error: 'NOTION_API_KEY not set', success: false });
+  }
+  try {
+    const notion = new Client({ auth: KEYS.NOTION });
+    await notion.users.me();
+    res.json({ success: true });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// Notion config (for actual API calls)
 const LOGS_DB_ID = '4ee3980e-62fa-4abe-a716-c7d6656011ba';
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
 
 // Local logs config - adjust path for your Victus setup
 const LOG_FILE = join(__dirname, '../../homebase-logs.jsonl');
@@ -74,8 +121,8 @@ app.post('/api/run-script/:name', (req, res) => {
 });
 
 let notion;
-if (NOTION_KEY) {
-  notion = new Client({ auth: NOTION_KEY });
+if (KEYS.NOTION) {
+  notion = new Client({ auth: KEYS.NOTION });
 }
 
 // Config
@@ -226,10 +273,10 @@ const ALPHA_PROMPTS = {
 
 // Call Gemini
 async function callGemini(prompt) {
-  if (!GEMINI_KEY) {
+  if (!KEYS.GEMINI) {
     return { provider: 'mock', output: 'No GEMINI_API_KEY' };
   }
-  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${KEYS.GEMINI}`;
   try {
     const res = await fetch(url, {
       method: 'POST',
