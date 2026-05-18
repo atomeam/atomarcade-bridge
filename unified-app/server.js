@@ -314,21 +314,7 @@ function logToFile(entry) {
   } catch (e) { console.error('Log error:', e.message); }
 }
 
-// Run Alpha step
-app.post('/api/run/:step', async (req, res) => {
-  const { step } = req.params;
-  if (!ALPHA_PROMPTS[step]) {
-    return res.json({ error: 'Unknown step', valid: Object.keys(ALPHA_PROMPTS) });
-  }
-  
-  logToFile({ step, status: 'running', message: `Running ${step}...` });
-  const result = await callGemini(ALPHA_PROMPTS[step]);
-  logToFile({ step, status: 'success', message: `Completed ${step}`, output: result.output });
-  
-  res.json({ step, ...result });
-});
-
-// Run full Alpha loop
+// Run full Alpha loop (must be before /:step)
 app.post('/api/run/alpha-loop', async (req, res) => {
   logToFile({ step: 'alpha-loop', status: 'running', message: 'Starting Alpha loop...' });
   
@@ -338,7 +324,7 @@ app.post('/api/run/alpha-loop', async (req, res) => {
   const obs = await callGemini(ALPHA_PROMPTS.observer);
   logToFile({ step: 'observer', status: 'success', output: obs.output });
   results.push({ step: 'observer', ...obs });
-  
+
   // If mock, stop here
   if (obs.provider === 'mock') {
     logToFile({ step: 'alpha-loop', status: 'mock', message: 'No API key - used mock' });
@@ -363,6 +349,20 @@ app.post('/api/run/alpha-loop', async (req, res) => {
   logToFile({ step: 'alpha-loop', status: 'success', message: 'Alpha loop complete' });
   
   res.json({ results });
+});
+
+// Run Alpha step
+app.post('/api/run/:step', async (req, res) => {
+  const { step } = req.params;
+  if (!ALPHA_PROMPTS[step]) {
+    return res.json({ error: 'Unknown step', valid: Object.keys(ALPHA_PROMPTS) });
+  }
+  
+  logToFile({ step, status: 'running', message: `Running ${step}...` });
+  const result = await callGemini(ALPHA_PROMPTS[step]);
+  logToFile({ step, status: 'success', message: `Completed ${step}`, output: result.output });
+  
+  res.json({ step, ...result });
 });
 
 app.use(express.static(join(__dirname, 'public')));
