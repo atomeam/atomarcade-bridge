@@ -20,6 +20,58 @@ const GEMINI_KEY = process.env.GEMINI_API_KEY;
 
 // Local logs config - adjust path for your Victus setup
 const LOG_FILE = join(__dirname, '../../homebase-logs.jsonl');
+const APPS_DIR = join(__dirname, '../..');
+const SCRIPTS = {
+  'homebase': join(APPS_DIR, 'homebase-launcher.ps1'),
+  'bridge': join(APPS_DIR, 'launch-homebase.ps1'),
+  'install': join(APPS_DIR, 'install-edge-app.ps1')
+};
+
+// Check local repo status (no API key needed)
+app.get('/api/repos/check', (req, res) => {
+  const results = [];
+  for (const repo of CONFIG.repos) {
+    const repoPath = join(APPS_DIR, repo.name);
+    const hasDir = existsSync(repoPath);
+    let lastCommit = null;
+    if (hasDir && existsSync(join(repoPath, '.git'))) {
+      try {
+        const head = readFileSync(join(repoPath, '.git', 'HEAD'), 'utf-8').trim();
+        lastCommit = head.substring(0, 7);
+      } catch { lastCommit = null; }
+    }
+    results.push({ name: repo.name, exists: hasDir, hasGit: hasDir && existsSync(join(repoPath, '.git')), branch: lastCommit });
+  }
+  res.json({ repos: results, checkedAt: new Date().toISOString() });
+});
+
+// Run a local script (no API key needed)
+app.post('/api/run-script/:name', (req, res) => {
+  const { name } = req.params;
+  const scriptPath = SCRIPTS[name];
+  if (!scriptPath || !existsSync(scriptPath)) {
+    return res.json({ error: 'Script not found', valid: Object.keys(SCRIPTS) });
+  }
+  
+  logToFile({ step: `script:${name}`, status: 'running', message: `Running ${name}...` });
+  
+  const isWin = process.platform === 'win32';
+  const proc = spawn(isWin ? 'powershell' : 'pwsh', ['-ExecutionPolicy', 'Bypass', '-File', scriptPath], { cwd: APPS_DIR });
+  
+  let output = '';
+  proc.stdout.on('data', d => output += d);
+  proc.stderr.on('data', d => output += d);
+  
+  proc.on('close', code => {
+    logToFile({ step: `script:${name}`, status: code === 0 ? 'success' : 'error', output: output.substring(0, 500) });
+    res.json({ name, exitCode: code, output: output.substring(0, 500) });
+  });
+  
+  proc.on('error', err => {
+    logToFile({ step: `script:${name}`, status: 'error', error: err.message });
+    res.json({ name, error: err.message });
+  });
+});
 
 let notion;
 if (NOTION_KEY) {
