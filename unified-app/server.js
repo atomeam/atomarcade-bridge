@@ -1,6 +1,6 @@
 // ╔══════════════════════════════════════════════════════════════╗
 // ║  atomeam-stack — unified-app/server.js                      ║
-// ║  Includes: Keys, Notion Sync, Alpha Loop, Real-Time Logs    ║
+// ║  Includes: Keys, Notion Sync, Alpha Loop, Real-Time Logs, Health   ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 import "dotenv/config";
@@ -15,15 +15,58 @@ const app = express();
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-const GEMINI_KEY  = process.env.GEMINI_API_KEY;
-const NOTION_KEY  = process.env.NOTION_API_KEY;
-const LOG_DB_ID   = process.env.ATOMARCADE_NOTION_LOG_DB_ID;
-const AI_MODEL    = process.env.HB_AI_MODEL    || "gpt-oss:20b";
-const OLLAMA_URL  = process.env.OLLAMA_URL      || "http://localhost:11434";
-const LOG_FILE    = process.env.HB_LOG_FILE     || "C:\\AtomArcade\\homebase-logs.jsonl";
-const PORT        = process.env.PORT            || 3000;
+// ── CONFIGURATION ─────────────────────────────────────────────────
+const CONFIG = {
+  geminiKey: process.env.GEMINI_API_KEY,
+  notionKey: process.env.NOTION_API_KEY,
+  logDbId: process.env.ATOMARCADE_NOTION_LOG_DB_ID,
+  aiModel: process.env.HB_AI_MODEL || "gpt-oss:20b",
+  ollamaUrl: process.env.OLLAMA_URL || "http://localhost:11434",
+  logFile: process.env.HB_LOG_FILE || "C:\\AtomArcade\\homebase-logs.jsonl",
+  port: process.env.PORT || 3000,
+};
 
-console.log(`[Keys] GEMINI: ${GEMINI_KEY ? "loaded" : "missing"}, NOTION: ${NOTION_KEY ? "loaded" : "missing"}`);
+// ── STARTUP ENV VALIDATION ──────────────────────────────────────────
+const REQUIRED_ENV_VARS = ["NOTION_API_KEY", "ATOMARCADE_NOTION_LOG_DB_ID"];
+const OPTIONAL_ENV_VARS = ["GEMINI_API_KEY", "OLLAMA_URL", "HB_AI_MODEL", "HB_LOG_FILE"];
+
+function validateEnvVars() {
+  const results = { required: [], optional: [] };
+  const now = Date.now();
+  
+  for (const key of REQUIRED_ENV_VARS) {
+    const value = process.env[key];
+    const ok = !!value;
+    results.required.push({ key, ok, value: ok ? "(set)" : null });
+    if (!ok) console.error(`[Env] MISSING required variable: ${key}`);
+  }
+  
+  for (const key of OPTIONAL_ENV_VARS) {
+    const value = process.env[key];
+    const ok = !!value;
+    results.optional.push({ key, ok, value: ok ? "(set)" : null });
+    if (!ok) console.warn(`[Env] OPTIONAL variable not set: ${key}`);
+  }
+  
+  const allRequired = results.required.every(r => r.ok);
+  if (!allRequired) {
+    console.warn(`[Env] Some required vars missing - some features may not work`);
+  } else {
+    console.log(`[Env] All required environment variables validated`);
+  }
+  
+  return results;
+}
+
+const envValidation = validateEnvVars();
+
+const GEMINI_KEY  = CONFIG.geminiKey;
+const NOTION_KEY  = CONFIG.notionKey;
+const LOG_DB_ID  = CONFIG.logDbId;
+const AI_MODEL  = CONFIG.aiModel;
+const OLLAMA_URL = CONFIG.ollamaUrl;
+const LOG_FILE  = CONFIG.logFile;
+const PORT      = CONFIG.port;
 
 // ── NOTION CLIENT ─────────────────────────────────────────────────────────────
 const notion = NOTION_KEY ? new Client({ auth: NOTION_KEY }) : null;
@@ -135,6 +178,83 @@ app.get("/api/status", (req, res) => res.json({
   ai: { model: AI_MODEL, ollama: OLLAMA_URL },
   logFile: LOG_FILE,
 }));
+
+// ── ROUTES: HEALTH ─────────────────────────────────────────────────
+const version = "1.0.0";
+
+async function checkEnv() {
+  const start = Date.now();
+  const missing = REQUIRED_ENV_VARS.filter(key => !process.env[key]);
+  return {
+    ok: missing.length === 0,
+    detail: missing.length > 0 ? `Missing: ${missing.join(", ")}` : "all required vars present",
+    latencyMs: Date.now() - start,
+    missing
+  };
+}
+
+async function checkNotion() {
+  const start = Date.now();
+  if (!NOTION_KEY) {
+    return { ok: false, detail: "not configured", latencyMs: Date.now() - start };
+  }
+  try {
+    await notion.users.me();
+    return { ok: true, detail: "connected", latencyMs: Date.now() - start };
+  } catch (e) {
+    return { ok: false, detail: e.message, latencyMs: Date.now() - start };
+  }
+}
+
+async function checkOllama() {
+  const start = Date.now();
+  try {
+    const res = await fetch(`${OLLAMA_URL}/api/tags`, { method: "GET" });
+    if (res.ok) {
+      const data = await res.json();
+      return { ok: true, detail: `${data.models?.length || 0} models loaded`, latencyMs: Date.now() - start };
+    }
+    return { ok: false, detail: `HTTP ${res.status}`, latencyMs: Date.now() - start };
+  } catch (e) {
+    return { ok: false, detail: e.message, latencyMs: Date.now() - start };
+  }
+}
+
+async function checkGemini() {
+  const start = Date.now();
+  if (!GEMINI_KEY) {
+    return { ok: false, detail: "not configured", latencyMs: Date.now() - start };
+  }
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`);
+    if (res.ok) {
+      const data = await res.json();
+      return { ok: true, detail: `${data.models?.length || 0} models available`, latencyMs: Date.now() - start };
+    }
+    return { ok: false, detail: `HTTP ${res.status}`, latencyMs: Date.now() - start };
+  } catch (e) {
+    return { ok: false, detail: e.message, latencyMs: Date.now() - start };
+  }
+}
+
+app.get("/api/health", async (req, res) => {
+  const [env, notion, ollama, gemini] = await Promise.all([
+    checkEnv(),
+    checkNotion(),
+    checkOllama(),
+    checkGemini()
+  ]);
+  
+  const checks = { env, notion, ollama, gemini };
+  const ok = env.ok && notion.ok && ollama.ok && gemini.ok;
+  
+  res.json({
+    ok,
+    version,
+    timestamp: new Date().toISOString(),
+    checks
+  });
+});
 
 // ── ROUTES: ALPHA LOOP ────────────────────────────────────────────────────────
 async function handleAlphaRun(req, res) {
