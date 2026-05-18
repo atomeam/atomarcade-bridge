@@ -1,0 +1,124 @@
+name: Dependabot auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same workflow and PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependabot-auto-merge:
+    runs-on: ubuntu-latest
+    # Only run for Dependabot PRs
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch PR info
+        id: pr-info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            
+            // Extract dependency info from PR title
+            // Format: "Bump actions/checkout from v3 to v4"
+            const titleMatch = pr.title.match(/Bump (\S+) from .* to (.*)/);
+            const dependency = titleMatch ? titleMatch[1] : 'unknown';
+            const newVersion = titleMatch ? titleMatch[2] : 'unknown';
+            
+            core.setOutput('pr_number', pr.number);
+            core.setOutput('dependency', dependency);
+            core.setOutput('new_version', newVersion);
+            core.setOutput('sha', pr.head.sha);
+            core.setOutput('branch', pr.head.ref);
+            
+            console.log(`Dependabot PR: ${dependency} -> ${newVersion}`);
+            console.log(`PR #${pr.number}, SHA: ${pr.head.sha}`);
+
+      - name: Wait for all checks to pass
+        id: wait-for-checks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = ${{ steps.pr-info.outputs.pr_number }};
+            const sha = ${{ steps.pr-info.outputs.sha }};
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            
+            // Wait for status checks to complete
+            let attempts = 0;
+            const maxAttempts = 60; // 30 minutes max
+            
+            async function getStatus() {
+              const { data: checks } = await github.rest.checks.listForRef({
+                owner,
+                repo,
+                ref: sha,
+                per_page: 100
+              });
+              
+              const completed = checks.check_runs.filter(c => c.status === 'completed');
+              const inProgress = checks.check_runs.filter(c => c.status !== 'completed');
+              
+              console.log(`Checks: ${completed.length} completed, ${inProgress.length} in progress`);
+              
+              // Check for failures
+              const failures = completed.filter(c => 
+                c.conclusion === 'failure' || c.conclusion === 'timed_out'
+              );
+              
+              if (failures.length > 0) {
+                console.log('Failed checks:', failures.map(c => c.name).join(', '));
+                return 'failed';
+              }
+              
+              if (inProgress.length > 0) {
+                return 'pending';
+              }
+              
+              // All checks completed successfully
+              const success = completed.every(c => 
+                c.conclusion === 'success' || c.conclusion === 'skipped'
+              );
+              
+              return success ? 'success' : 'unknown';
+            }
+            
+            let status = await getStatus();
+            
+            while (status === 'pending' && attempts < maxAttempts) {
+              attempts++;
+              console.log(`Waiting for checks... attempt ${attempts}/${maxAttempts}`);
+              await new Promise(resolve => setTimeout(resolve, 30000));
+              status = await getStatus();
+            }
+            
+            if (status === 'success') {
+              console.log('All checks passed!');
+            } else if (status === 'failed') {
+              console.log('Some checks failed');
+            }
+            
+            core.setOutput('status', status);
+
+      - name: Merge PR
+        if: steps.wait-for-checks.outputs.status == 'success'
+        run: |
+          gh pr merge ${{ steps.pr-info.outputs.pr_number }} \
+            --auto \
+            --merge \
+            --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Report status
+        run: |
+          if [[ "${{ steps.wait-for-checks.outputs.status }}" == "success" ]]; then
+            echo "✅ Successfully auto-merged PR #${{ steps.pr-info.outputs.pr_number }}"
+            echo "Dependency: ${{ steps.pr-info.outputs.dependency }} -> ${{ steps.pr-info.outputs.new_version }}"
+          else
+            echo "❌ Checks did not pass, PR not merged"
+          fi
