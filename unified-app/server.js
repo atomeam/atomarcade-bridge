@@ -5,6 +5,10 @@ import { fileURLToPath } from 'url';
 import { join } from 'path';
 import { readFileSync, appendFileSync, existsSync, statSync } from 'fs';
 import { spawn } from 'child_process';
+import dotenv from 'dotenv';
+
+// Load local .env
+dotenv.config({ path: join(fileURLToPath(new URL('.', import.meta.url)), '.env') });
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const app = express();
@@ -13,17 +17,126 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
-// Notion config
-const NOTION_KEY = process.env.NOTION_API_KEY || process.env.GEMINI_API_KEY;
+// Key validation at startup
+const FAIL_FAST = process.env.FAIL_FAST === '1';
+const KEYS = {
+  GEMINI: process.env.GEMINI_API_KEY,
+  NOTION: process.env.NOTION_API_KEY
+};
+
+const KEY_STATUS = {
+  GEMINI: KEYS.GEMINI ? 'loaded' : 'missing',
+  NOTION: KEYS.NOTION ? 'loaded' : 'missing',
+  FAIL_FAST,
+  checkedAt: new Date().toISOString()
+};
+
+// Fail fast check
+if (FAIL_FAST && (!KEYS.GEMINI || !KEYS.NOTION)) {
+  const missing = [];
+  if (!KEYS.GEMINI) missing.push('GEMINI_API_KEY');
+  if (!KEYS.NOTION) missing.push('NOTION_API_KEY');
+  throw new Error(`❌ FATAL: Missing required keys: ${missing.join(', ')}`);
+}
+
+console.log(FAIL_FAST ? "[Keys] FAIL_FAST mode - keys required" : `[Keys] GEMINI: ${KEY_STATUS.GEMINI}, NOTION: ${KEY_STATUS.NOTION}`);
+
+// Endpoint: Check key status
+app.get('/api/keys', (req, res) => {
+  res.json(KEY_STATUS);
+});
+
+// Endpoint: Test Gemini (simple call)
+app.get('/api/keys/gemini/test', async (req, res) => {
+  if (!KEYS.GEMINI) {
+    return res.json({ error: 'GEMINI_API_KEY not set', success: false });
+  }
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1/models?key=${KEYS.GEMINI}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    const ok = resp.ok && !data.error;
+    res.json({ success: ok, error: data.error, models: data.models?.length || 0 });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: Test Notion (ping)
+app.get('/api/keys/notion/test', async (req, res) => {
+  if (!KEYS.NOTION) {
+    return res.json({ error: 'NOTION_API_KEY not set', success: false });
+  }
+  try {
+    const notion = new Client({ auth: KEYS.NOTION });
+    await notion.users.me();
+    res.json({ success: true });
+  } catch (e) {
+    res.json({ success: false, error: e.message });
+  }
+});
+
+// Notion config (for actual API calls)
 const LOGS_DB_ID = '4ee3980e-62fa-4abe-a716-c7d6656011ba';
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
 
 // Local logs config - adjust path for your Victus setup
 const LOG_FILE = join(__dirname, '../../homebase-logs.jsonl');
+const APPS_DIR = join(__dirname, '../..');
+const SCRIPTS = {
+  'homebase': join(APPS_DIR, 'homebase-launcher.ps1'),
+  'bridge': join(APPS_DIR, 'launch-homebase.ps1'),
+  'install': join(APPS_DIR, 'install-edge-app.ps1')
+};
+
+// Check local repo status (no API key needed)
+app.get('/api/repos/check', (req, res) => {
+  const results = [];
+  for (const repo of CONFIG.repos) {
+    const repoPath = join(APPS_DIR, repo.name);
+    const hasDir = existsSync(repoPath);
+    let lastCommit = null;
+    if (hasDir && existsSync(join(repoPath, '.git'))) {
+      try {
+        const head = readFileSync(join(repoPath, '.git', 'HEAD'), 'utf-8').trim();
+        lastCommit = head.substring(0, 7);
+      } catch { lastCommit = null; }
+    }
+    results.push({ name: repo.name, exists: hasDir, hasGit: hasDir && existsSync(join(repoPath, '.git')), branch: lastCommit });
+  }
+  res.json({ repos: results, checkedAt: new Date().toISOString() });
+});
+
+// Run a local script (no API key needed)
+app.post('/api/run-script/:name', (req, res) => {
+  const { name } = req.params;
+  const scriptPath = SCRIPTS[name];
+  if (!scriptPath || !existsSync(scriptPath)) {
+    return res.json({ error: 'Script not found', valid: Object.keys(SCRIPTS) });
+  }
+  
+  logToFile({ step: `script:${name}`, status: 'running', message: `Running ${name}...` });
+  
+  const isWin = process.platform === 'win32';
+  const proc = spawn(isWin ? 'powershell' : 'pwsh', ['-ExecutionPolicy', 'Bypass', '-File', scriptPath], { cwd: APPS_DIR });
+  
+  let output = '';
+  proc.stdout.on('data', d => output += d);
+  proc.stderr.on('data', d => output += d);
+  
+  proc.on('close', code => {
+    logToFile({ step: `script:${name}`, status: code === 0 ? 'success' : 'error', output: output.substring(0, 500) });
+    res.json({ name, exitCode: code, output: output.substring(0, 500) });
+  });
+  
+  proc.on('error', err => {
+    logToFile({ step: `script:${name}`, status: 'error', error: err.message });
+    res.json({ name, error: err.message });
+  });
+});
 
 let notion;
-if (NOTION_KEY) {
-  notion = new Client({ auth: NOTION_KEY });
+if (KEYS.NOTION) {
+  notion = new Client({ auth: KEYS.NOTION });
 }
 
 // Config
@@ -66,8 +179,64 @@ app.get('/api/tools', (req, res) => {
   res.json(CONFIG.tools);
 });
 
-app.get('/api/logs', (req, res) => {
+// Log files config
+app.get('/api/log-files', (req, res) => {
   res.json(CONFIG.logs.map(l => ({ name: l.name, exists: true })));
+});
+
+// Read local logs with filtering
+app.get('/api/logs', (req, res) => {
+  try {
+    if (!existsSync(LOG_FILE)) {
+      return res.json({ entries: [], file: LOG_FILE, note: 'File not found yet' });
+    }
+    const content = readFileSync(LOG_FILE, 'utf-8');
+    const allEntries = content.trim().split('\n').map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean).reverse();
+    
+    // Filter by step/status if provided
+    const { step, status, limit } = req.query;
+    let entries = allEntries;
+    if (step) entries = entries.filter(e => e.step === step);
+    if (status) entries = entries.filter(e => e.status === status);
+    if (limit) entries = entries.slice(0, parseInt(limit));
+    
+    res.json({ 
+      entries, 
+      count: entries.length, 
+      total: allEntries.length,
+      file: LOG_FILE,
+      filters: { step, status }
+    });
+  } catch (e) {
+    res.json({ error: e.message, entries: [], file: LOG_FILE });
+  }
+});
+
+// Stream logs (Server-Sent Events)
+app.get('/api/logs/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/eventstream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  
+  try {
+    if (existsSync(LOG_FILE)) {
+      const content = readFileSync(LOG_FILE, 'utf-8');
+      const entries = content.trim().split('\n').slice(-10).map(line => {
+        try { return JSON.parse(line); } catch { return null; }
+      }).filter(Boolean).reverse();
+      res.write(`data: ${JSON.stringify({ type: 'init', entries })}\n\n`);
+    }
+  } catch (e) {
+    res.write(`data: ${JSON.stringify({ type: 'error', error: e.message })}\n\n`);
+  }
+  
+  const interval = setInterval(() => {
+    res.write(`data: ${JSON.stringify({ type: 'ping', ts: new Date().toISOString() })}\n\n`);
+  }, 15000);
+  
+  req.on('close', () => clearInterval(interval));
 });
 
 // Notion logs endpoint
@@ -118,10 +287,10 @@ const ALPHA_PROMPTS = {
 
 // Call Gemini
 async function callGemini(prompt) {
-  if (!GEMINI_KEY) {
+  if (!KEYS.GEMINI) {
     return { provider: 'mock', output: 'No GEMINI_API_KEY' };
   }
-  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`;
+  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${KEYS.GEMINI}`;
   try {
     const res = await fetch(url, {
       method: 'POST',
