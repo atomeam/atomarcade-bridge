@@ -1,390 +1,229 @@
-import express from 'express';
-import cors from 'cors';
-import { Client } from '@notionhq/client';
-import { fileURLToPath } from 'url';
-import { join } from 'path';
-import { readFileSync, appendFileSync, existsSync, statSync } from 'fs';
-import { spawn } from 'child_process';
-import dotenv from 'dotenv';
-dotenv.config(); // Load .env from default locations
+// ╔══════════════════════════════════════════════════════════════╗
+// ║  atomeam-stack — unified-app/server.js                      ║
+// ║  Includes: Keys, Notion Sync, Alpha Loop, Real-Time Logs    ║
+// ╚══════════════════════════════════════════════════════════════╝
 
-import { pingNotion, appendLogEntry } from './modules/notion-sync.js';
+import "dotenv/config";
+import express from "express";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { Client } from "@notionhq/client";
 
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
-const PORT = 3000;
-
-app.use(cors());
 app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
 
-// Key validation at startup
-const FAIL_FAST = process.env.FAIL_FAST === '1';
-const KEYS = {
-  GEMINI: process.env.GEMINI_API_KEY,
-  NOTION: process.env.NOTION_API_KEY
-};
+const GEMINI_KEY  = process.env.GEMINI_API_KEY;
+const NOTION_KEY  = process.env.NOTION_API_KEY;
+const LOG_DB_ID   = process.env.ATOMARCADE_NOTION_LOG_DB_ID;
+const AI_MODEL    = process.env.HB_AI_MODEL    || "gpt-oss:20b";
+const OLLAMA_URL  = process.env.OLLAMA_URL      || "http://localhost:11434";
+const LOG_FILE    = process.env.HB_LOG_FILE     || "C:\\AtomArcade\\homebase-logs.jsonl";
+const PORT        = process.env.PORT            || 3000;
 
-const KEY_STATUS = {
-  GEMINI: KEYS.GEMINI ? 'loaded' : 'missing',
-  NOTION: KEYS.NOTION ? 'loaded' : 'missing',
-  FAIL_FAST,
-  checkedAt: new Date().toISOString()
-};
+console.log(`[Keys] GEMINI: ${GEMINI_KEY ? "loaded" : "missing"}, NOTION: ${NOTION_KEY ? "loaded" : "missing"}`);
 
-// Fail fast check
-if (FAIL_FAST && (!KEYS.GEMINI || !KEYS.NOTION)) {
-  const missing = [];
-  if (!KEYS.GEMINI) missing.push('GEMINI_API_KEY');
-  if (!KEYS.NOTION) missing.push('NOTION_API_KEY');
-  throw new Error(`❌ FATAL: Missing required keys: ${missing.join(', ')}`);
+// ── NOTION CLIENT ─────────────────────────────────────────────────────────────
+const notion = NOTION_KEY ? new Client({ auth: NOTION_KEY }) : null;
+
+// ── NOTION SYNC ───────────────────────────────────────────────────────────────
+async function appendLogEntry({
+  event, level = "info", kind = "", source = "unified-app",
+  executor = "unified-app@localhost", intent = "", outcome = "success",
+  mode = "apply", payload = null, trace_id = null,
+  reason_code = null, latency_ms = null,
+}) {
+  await notion.pages.create({
+    parent: { database_id: LOG_DB_ID },
+    properties: {
+      Event:    { title:      [{ text: { content: event } }] },
+      Timestamp:{ date:       { start: new Date().toISOString() } },
+      Level:    { select:     { name: level } },
+      Kind:     { rich_text:  [{ text: { content: kind } }] },
+      Source:   { rich_text:  [{ text: { content: source } }] },
+      Executor: { rich_text:  [{ text: { content: executor } }] },
+      intent:   { rich_text:  [{ text: { content: intent } }] },
+      outcome:  { select:     { name: outcome } },
+      mode:     { select:     { name: mode } },
+      ...(payload     && { Payload:     { rich_text: [{ text: { content: typeof payload === "object" ? JSON.stringify(payload) : payload } }] } }),
+      ...(trace_id    && { trace_id:    { rich_text: [{ text: { content: trace_id } }] } }),
+      ...(reason_code && { reason_code: { rich_text: [{ text: { content: reason_code } }] } }),
+      ...(latency_ms !== null && { latency_ms: { number: latency_ms } }),
+    },
+  });
 }
 
-console.log(FAIL_FAST ? "[Keys] FAIL_FAST mode - keys required" : `[Keys] GEMINI: ${KEY_STATUS.GEMINI}, NOTION: ${KEY_STATUS.NOTION}`);
+// ── AI ORCHESTRATOR: Ollama → Gemini → Mock ───────────────────────────────────
+async function runAlphaOrchestrator({ prompt, systemInstruction, intent, trace_id }) {
+  const start = Date.now();
+  const sys = systemInstruction || "You are an adaptive context engine runner.";
 
-// Endpoint: Check key status
-app.get('/api/keys', (req, res) => {
-  res.json(KEY_STATUS);
-});
-
-// Endpoint: Test Gemini (simple call)
-app.get('/api/keys/gemini/test', async (req, res) => {
-  if (!KEYS.GEMINI) {
-    return res.json({ error: 'GEMINI_API_KEY not set', success: false });
-  }
+  // 1. Ollama (local, free)
   try {
-    const url = `https://generativelanguage.googleapis.com/v1/models?key=${KEYS.GEMINI}`;
-    const resp = await fetch(url);
-    const data = await resp.json();
-    const ok = resp.ok && !data.error;
-    res.json({ success: ok, error: data.error, models: data.models?.length || 0 });
-  } catch (e) {
-    res.json({ success: false, error: e.message });
+    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: AI_MODEL, prompt, system: sys, stream: false }),
+    });
+    if (res.ok) {
+      const d = await res.json();
+      return { success: true, mock: false, provider: "ollama", model: d.model, text: d.response, trace_id, latency_ms: Date.now() - start };
+    }
+  } catch (e) { console.warn("[Alpha] Ollama unavailable:", e.message); }
+
+  // 2. Gemini (fallback)
+  if (GEMINI_KEY) {
+    try {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
+        { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }) }
+      );
+      if (res.ok) {
+        const d = await res.json();
+        const text = d.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        return { success: true, mock: false, provider: "gemini", model: "gemini-2.0-flash", text, trace_id, latency_ms: Date.now() - start };
+      }
+    } catch (e) { console.warn("[Alpha] Gemini unavailable:", e.message); }
   }
+
+  // 3. Mock (last resort)
+  return { success: true, mock: true, provider: "mock", model: "mock", text: `[MOCK] Echo: ${prompt}`, trace_id, latency_ms: Date.now() - start };
+}
+
+// ── ROUTES: KEYS ──────────────────────────────────────────────────────────────
+app.get("/api/keys", (req, res) => res.json({
+  GEMINI: GEMINI_KEY ? "loaded" : "missing",
+  NOTION: NOTION_KEY ? "loaded" : "missing",
+  FAIL_FAST: false,
+  checkedAt: new Date().toISOString(),
+}));
+
+app.get("/api/keys/notion/test", async (req, res) => {
+  if (!NOTION_KEY) return res.json({ ok: false, error: "No NOTION_API_KEY" });
+  try {
+    const u = await notion.users.me();
+    res.json({ ok: true, user: u.name });
+  } catch (e) { res.json({ ok: false, error: e.message }); }
 });
 
-// Endpoint: Test Notion (ping)
-app.get('/api/keys/notion/test', (req, res) => {
-  const key = process.env.NOTION_API_KEY;
-  if (!key) {
-    res.json({ ok: false, error: 'No NOTION_API_KEY' });
+app.get("/api/keys/gemini/test", async (req, res) => {
+  if (!GEMINI_KEY) return res.json({ success: false, error: "No GEMINI_API_KEY" });
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`);
+    const d = await r.json();
+    res.json({ success: true, models: d.models?.length ?? 0 });
+  } catch (e) { res.json({ success: false, error: e.message }); }
+});
+
+// ── ROUTES: NOTION LOG ────────────────────────────────────────────────────────
+app.post("/api/notion/log", async (req, res) => {
+  if (!NOTION_KEY)  return res.status(500).json({ ok: false, error: "No NOTION_API_KEY" });
+  if (!LOG_DB_ID)   return res.status(500).json({ ok: false, error: "No ATOMARCADE_NOTION_LOG_DB_ID" });
+  if (!req.body.event) return res.status(400).json({ ok: false, error: "event is required" });
+  try { await appendLogEntry(req.body); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ROUTES: STATUS ────────────────────────────────────────────────────────────
+app.get("/api/status", (req, res) => res.json({
+  timestamp: new Date().toISOString(),
+  uptime_s: Math.floor(process.uptime()),
+  keys: { gemini: !!GEMINI_KEY, notion: !!NOTION_KEY },
+  ai: { model: AI_MODEL, ollama: OLLAMA_URL },
+  logFile: LOG_FILE,
+}));
+
+// ── ROUTES: ALPHA LOOP ────────────────────────────────────────────────────────
+async function handleAlphaRun(req, res) {
+  const result = await runAlphaOrchestrator(req.body);
+  // Auto-log every run to Notion Bridge Logs
+  if (LOG_DB_ID && NOTION_KEY) {
+    appendLogEntry({
+      event:     `Alpha run — ${req.body.intent || "observer"}`,
+      level:     result.success ? "info" : "error",
+      kind:      "alpha-loop",
+      source:    "unified-app",
+      intent:    req.body.intent || "observer",
+      outcome:   result.success ? "success" : "failure",
+      trace_id:  req.body.trace_id || null,
+      latency_ms: result.latency_ms,
+      payload:   { provider: result.provider, model: result.model },
+    }).catch(e => console.warn("[Notion] log error:", e.message));
+  }
+  res.json(result);
+}
+app.post("/api/run/observer", handleAlphaRun);
+app.post("/api/alpha/run",    handleAlphaRun);
+
+// ── OPTION C: REAL-TIME LOG STREAM (SSE) ──────────────────────────────────────
+const SSE_CLIENTS = new Set();
+
+function getRecentLogs(n = 50) {
+  try {
+    if (!fs.existsSync(LOG_FILE)) return [];
+    const lines = fs.readFileSync(LOG_FILE, "utf8").trim().split("\n").filter(Boolean);
+    return lines.slice(-n).map(l => { try { return JSON.parse(l); } catch { return { raw: l }; } });
+  } catch (e) { return [{ error: e.message }]; }
+}
+
+// GET /api/logs/recent — last N lines as JSON array
+app.get("/api/logs/recent", (req, res) => {
+  const n = Math.min(parseInt(req.query.n) || 50, 200);
+  res.json({ logs: getRecentLogs(n), file: LOG_FILE });
+});
+
+// GET /api/logs/stream — live SSE feed
+app.get("/api/logs/stream", (req, res) => {
+  res.setHeader("Content-Type",  "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection",    "keep-alive");
+  res.flushHeaders();
+
+  // Replay last 20 lines on connect so the UI isn't blank
+  for (const log of getRecentLogs(20)) {
+    res.write(`data: ${JSON.stringify(log)}\n\n`);
+  }
+
+  SSE_CLIENTS.add(res);
+  req.on("close", () => SSE_CLIENTS.delete(res));
+});
+
+// Tail the log file — broadcast new lines to all SSE clients
+let lastSize = 0;
+function watchLogFile() {
+  if (!fs.existsSync(LOG_FILE)) {
+    setTimeout(watchLogFile, 5000); // retry until the file appears
     return;
   }
-  const notion = new Client({ auth: key });
-  notion.users.me()
-    .then(user => res.json({ ok: true, user: user.name || user.id }))
-    .catch(e => res.json({ ok: false, error: e.message }));
-});
+  lastSize = fs.statSync(LOG_FILE).size;
+  console.log(`[LogStream] Watching ${LOG_FILE}`);
 
-// Notion config (for actual API calls)
-const LOGS_DB_ID = '4ee3980e-62fa-4abe-a716-c7d6656011ba';
-
-// Local logs config - adjust path for your Victus setup
-const LOG_FILE = join(__dirname, '../../homebase-logs.jsonl');
-const APPS_DIR = join(__dirname, '../..');
-const SCRIPTS = {
-  'homebase': join(APPS_DIR, 'homebase-launcher.ps1'),
-  'bridge': join(APPS_DIR, 'launch-homebase.ps1'),
-  'install': join(APPS_DIR, 'install-edge-app.ps1')
-};
-
-// Check local repo status (no API key needed)
-app.get('/api/repos/check', (req, res) => {
-  const results = [];
-  for (const repo of CONFIG.repos) {
-    const repoPath = join(APPS_DIR, repo.name);
-    const hasDir = existsSync(repoPath);
-    let lastCommit = null;
-    if (hasDir && existsSync(join(repoPath, '.git'))) {
-      try {
-        const head = readFileSync(join(repoPath, '.git', 'HEAD'), 'utf-8').trim();
-        lastCommit = head.substring(0, 7);
-      } catch { lastCommit = null; }
-    }
-    results.push({ name: repo.name, exists: hasDir, hasGit: hasDir && existsSync(join(repoPath, '.git')), branch: lastCommit });
-  }
-  res.json({ repos: results, checkedAt: new Date().toISOString() });
-});
-
-// Run a local script (no API key needed)
-app.post('/api/run-script/:name', (req, res) => {
-  const { name } = req.params;
-  const scriptPath = SCRIPTS[name];
-  if (!scriptPath || !existsSync(scriptPath)) {
-    return res.json({ error: 'Script not found', valid: Object.keys(SCRIPTS) });
-  }
-  
-  logToFile({ step: `script:${name}`, status: 'running', message: `Running ${name}...` });
-  
-  const isWin = process.platform === 'win32';
-  const proc = spawn(isWin ? 'powershell' : 'pwsh', ['-ExecutionPolicy', 'Bypass', '-File', scriptPath], { cwd: APPS_DIR });
-  
-  let output = '';
-  proc.stdout.on('data', d => output += d);
-  proc.stderr.on('data', d => output += d);
-  
-  proc.on('close', code => {
-    logToFile({ step: `script:${name}`, status: code === 0 ? 'success' : 'error', output: output.substring(0, 500) });
-    res.json({ name, exitCode: code, output: output.substring(0, 500) });
+  fs.watch(LOG_FILE, (event) => {
+    if (event !== "change") return;
+    try {
+      const { size } = fs.statSync(LOG_FILE);
+      if (size <= lastSize) return;
+      const stream = fs.createReadStream(LOG_FILE, { start: lastSize, end: size });
+      let buf = "";
+      stream.on("data", c => buf += c);
+      stream.on("end", () => {
+        lastSize = size;
+        for (const line of buf.trim().split("\n").filter(Boolean)) {
+          let parsed;
+          try { parsed = JSON.parse(line); } catch { parsed = { raw: line }; }
+          const msg = `data: ${JSON.stringify(parsed)}\n\n`;
+          for (const client of SSE_CLIENTS) {
+            try { client.write(msg); } catch { SSE_CLIENTS.delete(client); }
+          }
+        }
+      });
+    } catch (e) { console.warn("[LogStream] error:", e.message); }
   });
-  
-  proc.on('error', err => {
-    logToFile({ step: `script:${name}`, status: 'error', error: err.message });
-    res.json({ name, error: err.message });
-  });
-});
-
-let notion;
-if (KEYS.NOTION) {
-  notion = new Client({ auth: KEYS.NOTION });
 }
+watchLogFile();
 
-// Config
-const CONFIG = {
-  repos: [
-    { name: 'atomarcade-bridge', path: '../atomarcade-bridge' },
-    { name: 'Aether', path: '../Aether' },
-    { name: 'ALPHA', path: '../ALPHA' }
-  ],
-  logs: [
-    { name: 'HomeBase Logs', path: '../atomarcade-bridge/homebase-logs.jsonl' },
-    { name: 'Bridge Logs', path: '../atomarcade-bridge/homebase-chat.jsonl' }
-  ],
-  tools: [
-    { name: 'HomeBase', file: '../atomarcade-bridge/homebase.ps1', cmd: 'pwsh' },
-    { name: 'Recovery', file: '../atomarcade-bridge/tools/fresh-start-homebase-recovery.ps1', cmd: 'pwsh' }
-  ]
-};
-
-app.get('/api/status', (req, res) => {
-  res.json({
-    timestamp: new Date().toISOString(),
-    summary: {
-      totalRepos: CONFIG.repos.length,
-      totalLogs: CONFIG.logs.length,
-      totalTools: CONFIG.tools.length
-    },
-    notion: {
-      connected: !!KEYS.NOTION,
-      db: LOGS_DB_ID
-    }
-  });
-});
-
-// Write to Notion log
-app.post('/api/notion/log', async (req, res) => {
-  const { event, level = 'info', kind = '', source = 'api', intent = '', outcome = 'success', mode = 'apply', payload } = req.body;
-  const result = await appendLogEntry(LOGS_DB_ID, { event: event || 'API Log', level, kind, source, intent, outcome, mode, payload });
-  res.json(result);
-});
-
-app.get('/api/repos', (req, res) => {
-  res.json(CONFIG.repos.map(r => ({ name: r.name, exists: true })));
-});
-
-app.get('/api/tools', (req, res) => {
-  res.json(CONFIG.tools);
-});
-
-// Log files config
-app.get('/api/log-files', (req, res) => {
-  res.json(CONFIG.logs.map(l => ({ name: l.name, exists: true })));
-});
-
-// Read local logs with filtering
-app.get('/api/logs', (req, res) => {
-  try {
-    if (!existsSync(LOG_FILE)) {
-      return res.json({ entries: [], file: LOG_FILE, note: 'File not found yet' });
-    }
-    const content = readFileSync(LOG_FILE, 'utf-8');
-    const allEntries = content.trim().split('\n').map(line => {
-      try { return JSON.parse(line); } catch { return null; }
-    }).filter(Boolean).reverse();
-    
-    // Filter by step/status if provided
-    const { step, status, limit } = req.query;
-    let entries = allEntries;
-    if (step) entries = entries.filter(e => e.step === step);
-    if (status) entries = entries.filter(e => e.status === status);
-    if (limit) entries = entries.slice(0, parseInt(limit));
-    
-    res.json({ 
-      entries, 
-      count: entries.length, 
-      total: allEntries.length,
-      file: LOG_FILE,
-      filters: { step, status }
-    });
-  } catch (e) {
-    res.json({ error: e.message, entries: [], file: LOG_FILE });
-  }
-});
-
-// Stream logs (Server-Sent Events)
-app.get('/api/logs/stream', (req, res) => {
-  res.setHeader('Content-Type', 'text/eventstream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  
-  try {
-    if (existsSync(LOG_FILE)) {
-      const content = readFileSync(LOG_FILE, 'utf-8');
-      const entries = content.trim().split('\n').slice(-10).map(line => {
-        try { return JSON.parse(line); } catch { return null; }
-      }).filter(Boolean).reverse();
-      res.write(`data: ${JSON.stringify({ type: 'init', entries })}\n\n`);
-    }
-  } catch (e) {
-    res.write(`data: ${JSON.stringify({ type: 'error', error: e.message })}\n\n`);
-  }
-  
-  const interval = setInterval(() => {
-    res.write(`data: ${JSON.stringify({ type: 'ping', ts: new Date().toISOString() })}\n\n`);
-  }, 15000);
-  
-  req.on('close', () => clearInterval(interval));
-});
-
-// Notion logs endpoint
-app.get('/api/notion/logs', async (req, res) => {
-  if (!notion) {
-    return res.json({ error: 'No Notion API key', logs: [] });
-  }
-  try {
-    const response = await notion.databases.query({
-      database_id: LOGS_DB_ID,
-      sorts: [{ timestamp: 'created_time', direction: 'descending' }],
-      page_size: 10
-    });
-    const logs = response.results.map(page => ({
-      id: page.id,
-      created: page.created_time,
-      properties: page.properties
-    }));
-    res.json({ logs });
-  } catch (e) {
-    res.json({ error: e.message, logs: [] });
-  }
-});
-
-// Read local logs
-app.get('/api/logs', (req, res) => {
-  try {
-    if (!existsSync(LOG_FILE)) {
-      return res.json({ entries: [], file: LOG_FILE });
-    }
-    const content = readFileSync(LOG_FILE, 'utf-8');
-    const entries = content.trim().split('\n').slice(-50).map(line => {
-      try { return JSON.parse(line); } catch { return null; }
-    }).filter(Boolean).reverse();
-    res.json({ entries, count: entries.length, file: LOG_FILE });
-  } catch (e) {
-    res.json({ error: e.message, entries: [], file: LOG_FILE });
-  }
-});
-
-// Alpha loop prompts
-const ALPHA_PROMPTS = {
-  observer: `You are the Observer. Scan recent activity. Identify any anomalies or issues. Output brief JSON.`,
-  evaluator: `You are the Evaluator. Given these findings, classify by severity. Output brief JSON.`,
-  proposer: `You are the Proposer. Given classifications, generate 1-2 proposals. Output JSON.`,
-  curator: `You are the Curator. Review proposals. Apply 5-condition gate. Approve or deny. Output JSON.`
-};
-
-// Call Gemini
-async function callGemini(prompt) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) {
-    return { provider: 'mock', output: 'No GEMINI_API_KEY' };
-  }
-  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${key}`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.7, maxOutputTokens: 2048 }
-      })
-    });
-    const data = await res.json();
-    
-    // Handle API errors
-    if (data.error) {
-      return { provider: 'gemini', error: data.error.message, code: data.error.code };
-    }
-    if (!res.ok) {
-      return { provider: 'gemini', error: `HTTP ${res.status}`, details: data };
-    }
-    
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    return { provider: 'gemini', output: text || 'No response' };
-  } catch (e) {
-    return { provider: 'gemini', error: e.message };
-  }
-}
-
-// Log to file
-function logToFile(entry) {
-  try {
-    appendFileSync(LOG_FILE, JSON.stringify({ ...entry, ts: new Date().toISOString() }) + '\n', 'utf-8');
-  } catch (e) { console.error('Log error:', e.message); }
-}
-
-// Run full Alpha loop
-app.post('/api/alpha-loop', async (req, res) => {
-  logToFile({ step: 'alpha-loop', status: 'running', message: 'Starting Alpha loop...' });
-  
-  const results = [];
-  
-  // Observer
-  const obs = await callGemini(ALPHA_PROMPTS.observer);
-  logToFile({ step: 'observer', status: 'success', output: obs.output });
-  results.push({ step: 'observer', ...obs });
-
-  // If mock, stop here
-  if (obs.provider === 'mock') {
-    logToFile({ step: 'alpha-loop', status: 'mock', message: 'No API key - used mock' });
-    return res.json({ results, note: 'Mock mode - no API key' });
-  }
-  
-  // Evaluator
-  const evaluateResult = await callGemini(ALPHA_PROMPTS.evaluator);
-  logToFile({ step: 'evaluator', status: 'success', output: evaluateResult.output });
-  results.push({ step: 'evaluator', ...evaluateResult });
-  
-  // Proposer
-  const prop = await callGemini(ALPHA_PROMPTS.proposer);
-  logToFile({ step: 'proposer', status: 'success', output: prop.output });
-  results.push({ step: 'proposer', ...prop });
-  
-  // Curator
-  const cur = await callGemini(ALPHA_PROMPTS.curator);
-  logToFile({ step: 'curator', status: 'success', output: cur.output });
-  results.push({ step: 'curator', ...cur });
-  
-  logToFile({ step: 'alpha-loop', status: 'success', message: 'Alpha loop complete' });
-  
-  res.json({ results });
-});
-
-// Run Alpha step
-app.post('/api/run/:step', async (req, res) => {
-  const { step } = req.params;
-  
-  if (!ALPHA_PROMPTS[step]) {
-    return res.json({ error: 'Unknown step', valid: Object.keys(ALPHA_PROMPTS), hint: 'Use POST /api/alpha-loop for full loop' });
-  }
-  
-  logToFile({ step, status: 'running', message: `Running ${step}...` });
-  const result = await callGemini(ALPHA_PROMPTS[step]);
-  logToFile({ step, status: 'success', message: `Completed ${step}`, output: result.output });
-  
-  res.json({ step, ...result });
-});
-
-app.use(express.static(join(__dirname, 'public')));
-
-app.listen(PORT, () => {
-  console.log(`atomeam-stack running at http://localhost:${PORT}`);
-});
+// ── START ─────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => console.log(`atomeam-stack running at http://localhost:${PORT}`));
