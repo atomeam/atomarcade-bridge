@@ -66,8 +66,64 @@ app.get('/api/tools', (req, res) => {
   res.json(CONFIG.tools);
 });
 
-app.get('/api/logs', (req, res) => {
+// Log files config
+app.get('/api/log-files', (req, res) => {
   res.json(CONFIG.logs.map(l => ({ name: l.name, exists: true })));
+});
+
+// Read local logs with filtering
+app.get('/api/logs', (req, res) => {
+  try {
+    if (!existsSync(LOG_FILE)) {
+      return res.json({ entries: [], file: LOG_FILE, note: 'File not found yet' });
+    }
+    const content = readFileSync(LOG_FILE, 'utf-8');
+    const allEntries = content.trim().split('\n').map(line => {
+      try { return JSON.parse(line); } catch { return null; }
+    }).filter(Boolean).reverse();
+    
+    // Filter by step/status if provided
+    const { step, status, limit } = req.query;
+    let entries = allEntries;
+    if (step) entries = entries.filter(e => e.step === step);
+    if (status) entries = entries.filter(e => e.status === status);
+    if (limit) entries = entries.slice(0, parseInt(limit));
+    
+    res.json({ 
+      entries, 
+      count: entries.length, 
+      total: allEntries.length,
+      file: LOG_FILE,
+      filters: { step, status }
+    });
+  } catch (e) {
+    res.json({ error: e.message, entries: [], file: LOG_FILE });
+  }
+});
+
+// Stream logs (Server-Sent Events)
+app.get('/api/logs/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/eventstream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  
+  try {
+    if (existsSync(LOG_FILE)) {
+      const content = readFileSync(LOG_FILE, 'utf-8');
+      const entries = content.trim().split('\n').slice(-10).map(line => {
+        try { return JSON.parse(line); } catch { return null; }
+      }).filter(Boolean).reverse();
+      res.write(`data: ${JSON.stringify({ type: 'init', entries })}\n\n`);
+    }
+  } catch (e) {
+    res.write(`data: ${JSON.stringify({ type: 'error', error: e.message })}\n\n`);
+  }
+  
+  const interval = setInterval(() => {
+    res.write(`data: ${JSON.stringify({ type: 'ping', ts: new Date().toISOString() })}\n\n`);
+  }, 15000);
+  
+  req.on('close', () => clearInterval(interval));
 });
 
 // Notion logs endpoint
