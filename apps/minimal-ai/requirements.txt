@@ -1,0 +1,2 @@
+# Reference only. The VIKTOR runtime ships these already.
+requests>=2.31
