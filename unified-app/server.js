@@ -293,10 +293,11 @@ const ALPHA_PROMPTS = {
 
 // Call Gemini
 async function callGemini(prompt) {
-  if (!KEYS.GEMINI) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) {
     return { provider: 'mock', output: 'No GEMINI_API_KEY' };
   }
-  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${KEYS.GEMINI}`;
+  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash:generateContent?key=${key}`;
   try {
     const res = await fetch(url, {
       method: 'POST',
