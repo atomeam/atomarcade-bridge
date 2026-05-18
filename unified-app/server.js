@@ -6,19 +6,7 @@ import { join } from 'path';
 import { readFileSync, appendFileSync, existsSync, statSync } from 'fs';
 import { spawn } from 'child_process';
 import dotenv from 'dotenv';
-
-// Load .env FIRST
-const envPaths = [
-  join(fileURLToPath(new URL('.', import.meta.url)),
-  join(fileURLToPath(new URL('.', import.meta.url)), '..'),
-];
-for (const envPath of envPaths) {
-  const p = join(envPath, '.env');
-  if (existsSync(p)) {
-    dotenv.config({ path: p });
-    break;
-  }
-}
+dotenv.config(); // Load .env from default locations
 
 import { pingNotion, appendLogEntry } from './modules/notion-sync.js';
 
