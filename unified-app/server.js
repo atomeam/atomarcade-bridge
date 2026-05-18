@@ -179,8 +179,39 @@ app.get("/api/status", (req, res) => res.json({
   logFile: LOG_FILE,
 }));
 
+// ── VERSION METADATA ──────────────────────────────────────────────
+function getVersionMetadata() {
+  const { execSync } = require("child_process");
+  
+  // Try to get git SHA
+  let gitSha = "unknown";
+  try {
+    gitSha = execSync("git rev-parse --short HEAD", { encoding: "utf8", timeout: 1000 }).trim();
+  } catch {
+    gitSha = process.env.GIT_SHA || "unknown";
+  }
+  
+  // Try to read package.json for semver
+  let semver = "1.0.0";
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "package.json"), "utf8"));
+    semver = pkg.version || semver;
+  } catch {
+    // use default
+  }
+  
+  return {
+    service: "atomarcade-bridge",
+    semver,
+    gitSha,
+    node: process.version
+  };
+}
+
+const version = getVersionMetadata();
+
 // ── ROUTES: HEALTH ─────────────────────────────────────────────────
-const version = "1.0.0";
+const VERSION_STRING = version.semver;
 
 async function checkEnv() {
   const start = Date.now();
@@ -286,7 +317,8 @@ app.get("/api/health", async (req, res) => {
   
   res.json({
     ok,
-    version,
+    version: version.semver,
+    versionMeta: version,
     timestamp: new Date().toISOString(),
     checks
   });
