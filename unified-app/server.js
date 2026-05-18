@@ -199,10 +199,28 @@ async function checkNotion() {
     return { ok: false, detail: "not configured", latencyMs: Date.now() - start };
   }
   try {
-    await notion.users.me();
-    return { ok: true, detail: "connected", latencyMs: Date.now() - start };
+    // Deep check: verify token AND database is accessible
+    await notion.users.me(); // Basic auth check
+    
+    // Query the target DB to verify it's shared with the integration
+    if (LOG_DB_ID) {
+      await notion.databases.query({
+        database_id: LOG_DB_ID,
+        page_size: 1,
+      });
+    }
+    return { ok: true, detail: "connected (DB verified)", latencyMs: Date.now() - start };
   } catch (e) {
-    return { ok: false, detail: e.message, latencyMs: Date.now() - start };
+    // Parse specific error types
+    let detail = e.message;
+    if (e.code === 'object_not_found' || e.message.includes('not found')) {
+      detail = "Database not found or not shared with integration";
+    } else if (e.message.includes('Unauthorized') || e.message.includes('invalid')) {
+      detail = "Token invalid or expired";
+    } else if (e.message.includes('permission')) {
+      detail = "Permission denied to database";
+    }
+    return { ok: false, detail, latencyMs: Date.now() - start };
   }
 }
 
@@ -210,11 +228,29 @@ async function checkOllama() {
   const start = Date.now();
   try {
     const res = await fetch(`${OLLAMA_URL}/api/tags`, { method: "GET" });
-    if (res.ok) {
-      const data = await res.json();
-      return { ok: true, detail: `${data.models?.length || 0} models loaded`, latencyMs: Date.now() - start };
+    if (!res.ok) {
+      return { ok: false, detail: `HTTP ${res.status}`, latencyMs: Date.now() - start };
     }
-    return { ok: false, detail: `HTTP ${res.status}`, latencyMs: Date.now() - start };
+    
+    const data = await res.json();
+    const modelNames = (data.models || []).map(m => m.name || m.model);
+    
+    // Check if configured model exists
+    if (AI_MODEL) {
+      const modelFound = modelNames.some(name => 
+        name === AI_MODEL || name.startsWith(AI_MODEL.split(':')[0])
+      );
+      if (!modelFound) {
+        return { 
+          ok: false, 
+          detail: `Model "${AI_MODEL}" not found locally. Available: ${modelNames.slice(0, 5).join(', ')}${modelNames.length > 5 ? '...' : ''}`,
+          latencyMs: Date.now() - start 
+        };
+      }
+      return { ok: true, detail: `Model "${AI_MODEL}" ready (${modelNames.length} available)`, latencyMs: Date.now() - start };
+    }
+    
+    return { ok: true, detail: `${modelNames.length} models loaded`, latencyMs: Date.now() - start };
   } catch (e) {
     return { ok: false, detail: e.message, latencyMs: Date.now() - start };
   }

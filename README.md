@@ -80,8 +80,8 @@ Returns a structured health check of all dependencies. Each check runs in parall
   "timestamp": "2026-05-18T11:25:17.109Z",
   "checks": {
     "env":    { "ok": true,  "detail": "all required vars present", "latencyMs": 0 },
-    "notion": { "ok": true,  "detail": "connected", "latencyMs": 45 },
-    "ollama": { "ok": true,  "detail": "2 models loaded", "latencyMs": 23 },
+    "notion": { "ok": true,  "detail": "connected (DB verified)", "latencyMs": 45 },
+    "ollama": { "ok": true,  "detail": "Model \"gpt-oss:20b\" ready (2 available)", "latencyMs": 23 },
     "gemini": { "ok": false, "detail": "not configured", "latencyMs": 0 }
   }
 }
@@ -91,15 +91,29 @@ Returns a structured health check of all dependencies. Each check runs in parall
 
 - `ok: true` — All required checks passed
 - `ok: false` — One or more checks failed; inspect `checks` for details
-- `"detail"` field explains the state (e.g., "connected", "not configured", error message)
+- `"detail"` field explains the state (e.g., "connected (DB verified)", "Model not found locally")
 - `"latencyMs"` shows response time for each dependency
 
 ## Troubleshooting
 
-### Notion: "API token is invalid"
+### Notion: Token invalid or expired
 
 - Verify `NOTION_API_KEY` is correct (no extra quotes or spaces)
+- Token must start with `ntn_`
+
+### Notion: "Database not found" or "not shared with integration"
+
+- Verify `ATOMARCADE_NOTION_LOG_DB_ID` is correct
 - Confirm the integration has been **shared** with the target database in Notion
+
+### Notion: "Permission denied to database"
+
+- The integration has access but lacks required permissions
+
+### Ollama: Model not found locally
+
+- Verify `HB_AI_MODEL` matches an available model: `ollama list`
+- The check verifies the configured model is actually pulled and available
 
 ### Ollama: "fetch failed"
 
