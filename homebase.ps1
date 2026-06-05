@@ -8,10 +8,11 @@ $ErrorActionPreference = 'Stop'
 # ============================================================
 # Transcript logging (v0.6.8.6 - for Task Scheduler diagnostics)
 # Starts transcript for persistent logging when running as scheduled task
+# Uses timestamped filename per run (no -Append) to prevent file lock issues
 # ============================================================
 $transcriptPath = Join-Path $PSScriptRoot "homebase-transcript-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
 try {
-    Start-Transcript -Path $transcriptPath -Append -ErrorAction SilentlyContinue
+    Start-Transcript -Path $transcriptPath -ErrorAction SilentlyContinue
 } catch {
     # Transcript may fail if file locked, continue without it
 }
@@ -24,7 +25,7 @@ $RETROARCH_HOST  = '127.0.0.1'
 $RETROARCH_PORT  = 55355
 $UDP_TIMEOUT_MS  = 800
 $LOG_MAX         = 500
-$VERSION         = 'v0.6.8.6-heartbeat-monitor'
+$VERSION         = 'v0.6.8.7-production-ready'
 $GOVERNANCE_HASH = 'curator-policy-v0.6'
 
 # --- Notion Command Bus ---
@@ -1195,8 +1196,33 @@ Write-Host ""; Write-Host "  Open: http://localhost:$HTTP_PORT/"; Write-Host "  
 if ($NOTION_ENABLED) { $script:LastNotionPoll = [datetime]::MinValue }
 if ($NOTION_ENABLED) { $script:LastHeartbeat = [datetime]::MinValue }
 
+# ============================================================
+# Graceful shutdown handler (v0.6.8.6 - ensures transcript flushes cleanly)
+# Catches Ctrl+C and termination signals to stop transcript properly
+# ============================================================
+$script:ShutdownRequested = $false
+function Invoke-GracefulShutdown {
+    param([string]$Reason = 'unknown')
+    $script:ShutdownRequested = $true
+    Add-LogEntry -Kind 'SHUTDOWN' -Message "Graceful shutdown requested: $Reason"
+    Write-Log "GRACEFUL SHUTDOWN: $Reason"
+    try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
+}
+
+# Register shutdown handlers for Ctrl+C and process termination
+$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action {
+    Invoke-GracefulShutdown -Reason 'PowerShell.Exiting event'
+}
+
+# Handle Ctrl+C gracefully
+[Console]::TreatControlCAsInput = $false
+$null = Register-ObjectEvent -InputObject ([Console]) -EventName CancelKeyPress -Action {
+    Invoke-GracefulShutdown -Reason 'Ctrl+C pressed'
+    $sender.CancelKeyPress = $true  # Prevent default termination
+}
+
 try {
-    while ($listener.IsListening) {
+    while ($listener.IsListening -and -not $script:ShutdownRequested) {
         if ($NOTION_ENABLED -and ((Get-Date) - $script:LastNotionPoll).TotalSeconds -ge $NOTION_POLL_SECONDS) {
             $script:LastNotionPoll = Get-Date
             Tick-NotionPoller
@@ -1205,6 +1231,11 @@ try {
         # Heartbeat mechanism (v0.6.8.6)
         if ($NOTION_ENABLED -and ((Get-Date) - $script:LastHeartbeat).TotalSeconds -ge $HEARTBEAT_SECONDS) {
             Write-Heartbeat
+        }
+
+        # Check for graceful shutdown request
+        if ($script:ShutdownRequested) {
+            break
         }
 
         $asyncResult = $listener.BeginGetContext($null, $null)

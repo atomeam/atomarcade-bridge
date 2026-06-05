@@ -19,6 +19,24 @@ function Write-Log {
     Write-Host $Message
 }
 
+# ============================================================
+# Log cleanup (v0.6.8.6 - prevents unbounded log growth)
+# Deletes log files older than 14 days
+# ============================================================
+function Invoke-LogCleanup {
+    param([string]$Pattern, [int]$DaysToKeep = 14)
+    try {
+        $cutoffDate = (Get-Date).AddDays(-$DaysToKeep)
+        $oldLogs = Get-ChildItem -Path $PSScriptRoot -Filter $Pattern | Where-Object { $_.LastWriteTime -lt $cutoffDate }
+        if ($oldLogs) {
+            $oldLogs | Remove-Item -Force
+            Write-Log "Cleaned up $($oldLogs.Count) old log files (older than $DaysToKeep days)"
+        }
+    } catch {
+        Write-Log "Log cleanup failed: $($_.Exception.Message)"
+    }
+}
+
 function Send-NotionAlert {
     param([string]$Message, [string]$Level = 'error')
 
@@ -78,5 +96,9 @@ try {
     Write-Log "ERROR: $errorMsg"
     Send-NotionAlert -Message $errorMsg -Level 'error'
 }
+
+# Clean up old log files (heartbeat-monitor-task-*.log, homebase-transcript-*.log)
+Invoke-LogCleanup -Pattern 'heartbeat-monitor-task-*.log' -DaysToKeep 14
+Invoke-LogCleanup -Pattern 'homebase-transcript-*.log' -DaysToKeep 14
 
 Write-Log "Heartbeat check completed"
