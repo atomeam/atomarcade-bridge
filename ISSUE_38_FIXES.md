@@ -1,0 +1,222 @@
+# Issue #38 Fixes - Heartbeat Staleness & Bridge Monitoring
+
+## Summary
+Fixed the heartbeat staleness issue that caused the bridge to stop writing to Notion databases since 2026-05-12 11:10Z. Implemented comprehensive monitoring, alerting, and auto-restart mechanisms.
+
+## Root Cause Analysis
+The bridge process stopped writing heartbeat data because there was **no scheduled heartbeat mechanism**. The script only wrote to the Automations DB when processing commands from the Command Bus, so if no commands were queued, no heartbeat rows were written.
+
+## Fixes Implemented
+
+### 1. ✅ Heartbeat Mechanism (FIXED)
+**File:** `homebase.ps1`
+
+**Changes:**
+- Added `$HEARTBEAT_SECONDS = 300` (5-minute heartbeat interval)
+- Added `Write-Heartbeat()` function that writes heartbeat rows to Automations DB
+- Added heartbeat scheduling in main loop: checks every HEARTBEAT_SECONDS
+- Added heartbeat tracking: `$script:LastHeartbeat` and `$script:Metrics.heartbeat_writes_total`
+- Updated version from `v0.6.3-log-db-fallback` to `v0.6.8.6-heartbeat-monitor`
+
+**Heartbeat Data Written:**
+- Name: "Heartbeat - {hostname}"
+- Kind: "heartbeat"
+- Command: "SYSTEM_HEARTBEAT"
+- Interval: 300 seconds
+- Last Run: current timestamp
+- Run Count: incrementing counter
+- Last Result: uptime, memory, CPU stats
+
+### 2. ✅ Monitoring/Alerting (FIXED)
+**Files:** `homebase.ps1`, `heartbeat-monitor.ps1`
+
+**Changes:**
+- Added `/api/heartbeat/status` endpoint that returns:
+  - Last heartbeat timestamp
+  - Gap in seconds
+  - Is stale flag (gap > 30 minutes)
+  - Total heartbeats written
+- Added "Heartbeat Monitor" card to dashboard showing:
+  - Last heartbeat time
+  - Current gap
+  - Status (healthy/stale)
+  - Total heartbeats
+- Created `heartbeat-monitor.ps1` script that:
+  - Checks bridge heartbeat status every 10 minutes
+  - Sends alerts to Notion Logs DB if gap > 30 minutes
+  - Logs all checks to `heartbeat-monitor.log`
+
+**Alert Threshold:** 30 minutes (configurable via `$ALERT_THRESHOLD_MINUTES`)
+
+### 3. ✅ Logs DB Fallback (ALREADY FIXED)
+**File:** `homebase.ps1` (lines 23-28)
+
+**Status:** Already implemented in v0.6.3
+- Hardcoded fallback: `$NOTION_LOG_DB_ID_FALLBACK = '4ee3980e62fa4abea716c7d6656011ba'`
+- Env var takes precedence when present
+- Prevents silent logging failures
+
+### 4. ✅ Watchdog/Auto-Restart (FIXED)
+**File:** `setup-taskscheduler.ps1`
+
+**Changes:**
+- Created Task Scheduler setup script that configures:
+  - **Heartbeat Monitor Task:** Runs every 10 minutes
+  - **Bridge Auto-Restart Task:** Runs at startup, restarts on failure (3 retries, 5-minute intervals)
+- Both tasks configured to run whether user is logged on or not
+- Tasks run with highest privileges
+- No idle stop, battery-friendly
+
+**Usage:**
+```powershell
+# Run as Administrator
+pwsh -File setup-taskscheduler.ps1
+```
+
+### 5. ✅ Version Reporting (FIXED)
+**File:** `homebase.ps1` (line 16)
+
+**Changes:**
+- Updated `$VERSION` from `v0.6.3-log-db-fallback` to `v0.6.8.6-heartbeat-monitor`
+- Dashboard now reports correct version
+
+## Deployment Instructions
+
+### Step 1: Update Bridge Script
+```powershell
+# The homebase.ps1 file has been updated with all fixes
+# No manual changes needed
+```
+
+### Step 2: Deploy Monitoring Scripts
+```powershell
+# Files are already in place:
+# - heartbeat-monitor.ps1
+# - setup-taskscheduler.ps1
+```
+
+### Step 3: Setup Task Scheduler (Run as Administrator)
+```powershell
+cd C:\Users\adamm\atomarcade-bridge
+pwsh -File setup-taskscheduler.ps1
+```
+
+### Step 4: Restart Bridge
+```powershell
+# Stop existing bridge (Ctrl+C in current session)
+# Start new bridge:
+pwsh -File homebase.ps1
+```
+
+### Step 5: Verify Heartbeat
+```powershell
+# Check heartbeat status via API:
+Invoke-RestMethod -Uri 'http://localhost:8080/api/heartbeat/status'
+
+# Or check dashboard:
+# Open http://localhost:8080/
+# Look for "Heartbeat Monitor" card
+```
+
+### Step 6: Test Monitoring
+```powershell
+# Manually trigger heartbeat monitor:
+Start-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor'
+
+# Check monitor log:
+Get-Content heartbeat-monitor.log
+```
+
+## Verification Checklist
+
+- [ ] Bridge starts successfully with new version `v0.6.8.6-heartbeat-monitor`
+- [ ] Heartbeat rows appear in Automations DB every 5 minutes
+- [ ] Dashboard shows "Heartbeat Monitor" card with healthy status
+- [ ] `/api/heartbeat/status` returns correct heartbeat data
+- [ ] Task Scheduler tasks are created and enabled
+- [ ] Heartbeat monitor runs every 10 minutes
+- [ ] Bridge auto-restarts on failure
+- [ ] Alerts are sent to Notion Logs DB when heartbeat is stale
+
+## Monitoring & Troubleshooting
+
+### Check Heartbeat Status
+```powershell
+# Via API
+Invoke-RestMethod -Uri 'http://localhost:8080/api/heartbeat/status' | ConvertTo-Json
+
+# Via Dashboard
+# Open http://localhost:8080/ and check "Heartbeat Monitor" card
+```
+
+### Check Monitor Logs
+```powershell
+# Heartbeat monitor log
+Get-Content C:\Users\adamm\atomarcade-bridge\heartbeat-monitor.log -Tail 20
+
+# Bridge log
+Get-Content C:\Users\adamm\atomarcade-bridge\homebase.log -Tail 20
+
+# Bridge JSONL log
+Get-Content C:\Users\adamm\atomarcade-bridge\homebase-logs.jsonl -Tail 10
+```
+
+### Check Task Scheduler
+```powershell
+# List tasks
+Get-ScheduledTask | Where-Object { $_.TaskName -like '*AtomArcade*' }
+
+# Check task status
+Get-ScheduledTaskInfo -TaskName 'AtomArcade-HeartbeatMonitor'
+Get-ScheduledTaskInfo -TaskName 'AtomArcade-Bridge'
+
+# View task history
+Get-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor' | Export-ScheduledTask
+```
+
+### Manual Restart
+```powershell
+# Restart heartbeat monitor
+Stop-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor'
+Start-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor'
+
+# Restart bridge
+Stop-ScheduledTask -TaskName 'AtomArcade-Bridge'
+Start-ScheduledTask -TaskName 'AtomArcade-Bridge'
+```
+
+## Acceptance Criteria Met
+
+✅ **Root cause identified:** No scheduled heartbeat mechanism existed
+✅ **Heartbeat mechanism added:** Writes to Automations DB every 5 minutes
+✅ **Monitoring added:** 30+ minute gap detection via `/api/heartbeat/status`
+✅ **Alerting added:** Notion Logs DB alerts when heartbeat is stale
+✅ **Watchdog added:** Task Scheduler with auto-restart on failure
+✅ **Version fixed:** Updated to `v0.6.8.6-heartbeat-monitor`
+✅ **Logs DB fallback:** Already implemented in v0.6.3
+
+## Future Improvements
+
+1. **NSSM Service:** Consider migrating to NSSM for more robust service management
+2. **External Monitoring:** Add external monitoring (e.g., UptimeRobot, Pingdom)
+3. **Health Check Endpoint:** Add comprehensive health check for external monitoring
+4. **Graceful Shutdown:** Implement graceful shutdown on system power events
+5. **Configuration File:** Move hardcoded values to external config file
+
+## Files Modified
+
+- `homebase.ps1` - Main bridge script (heartbeat mechanism, monitoring, version fix)
+- `heartbeat-monitor.ps1` - New monitoring script
+- `setup-taskscheduler.ps1` - New Task Scheduler setup script
+- `ISSUE_38_FIXES.md` - This documentation file
+
+## Related Issues
+
+- Issue #38: Heartbeat staleness (this fix)
+- PR #37: Logs DB fallback (already implemented)
+- Issue #10: NSSM service install (future work)
+
+## Version History
+
+- v0.6.3-log-db-fallback: Logs DB fallback implemented
+- v0.6.8.6-heartbeat-monitor: Heartbeat mechanism, monitoring, alerting, auto-restart

@@ -13,7 +13,7 @@ $RETROARCH_HOST  = '127.0.0.1'
 $RETROARCH_PORT  = 55355
 $UDP_TIMEOUT_MS  = 800
 $LOG_MAX         = 500
-$VERSION         = 'v0.6.3-log-db-fallback'
+$VERSION         = 'v0.6.8.6-heartbeat-monitor'
 $GOVERNANCE_HASH = 'curator-policy-v0.6'
 
 # --- Notion Command Bus ---
@@ -27,6 +27,7 @@ $NOTION_AUTO_DB_ID     = $env:ATOMARCADE_NOTION_AUTO_DB_ID
 $NOTION_LOG_DB_ID_FALLBACK = '4ee3980e62fa4abea716c7d6656011ba'
 $NOTION_LOG_DB_ID      = if ([string]::IsNullOrWhiteSpace($env:ATOMARCADE_NOTION_LOG_DB_ID)) { $NOTION_LOG_DB_ID_FALLBACK } else { $env:ATOMARCADE_NOTION_LOG_DB_ID }
 $NOTION_POLL_SECONDS   = 5
+$HEARTBEAT_SECONDS     = 300  # Write heartbeat every 5 minutes
 $NOTION_API_VERSION    = '2022-06-28'
 $NOTION_ENABLED        = -not [string]::IsNullOrWhiteSpace($NOTION_TOKEN) -and -not [string]::IsNullOrWhiteSpace($NOTION_DATABASE_ID)
 
@@ -127,6 +128,7 @@ function Write-LocalJsonLog {
 $script:Log     = [System.Collections.Generic.List[object]]::new()
 $script:Started = Get-Date
 $script:Hostname = $env:COMPUTERNAME
+$script:LastHeartbeat = [datetime]::MinValue
 $script:Metrics = @{
     requests_total       = 0
     requests_errors      = 0
@@ -135,6 +137,7 @@ $script:Metrics = @{
     queue_writes_total   = 0
     retry_writes_total   = 0
     toggle_writes_total  = 0
+    heartbeat_writes_total = 0
 }
 
 function Add-LogEntry {
@@ -440,6 +443,50 @@ function Tick-NotionPoller {
     } catch {
         Add-LogEntry -Kind 'NOTION_ERR' -Message $_.Exception.Message
         Write-LocalJsonLog -Event 'notion-poller-error' -Level 'error' -Kind 'poller' -Origin 'bridge' -Status 'fail' -Result $_.Exception.Message
+    }
+}
+
+# ============================================================
+# Heartbeat mechanism (v0.6.8.6 — fix for issue #38)
+# Writes heartbeat row to Automations DB every HEARTBEAT_SECONDS
+# to detect bridge process death/liveness issues.
+# ============================================================
+function Write-Heartbeat {
+    if ([string]::IsNullOrWhiteSpace($NOTION_TOKEN)) {
+        return @{ ok=$false; error='ATOMARCADE_NOTION_TOKEN not set' }
+    }
+    if ([string]::IsNullOrWhiteSpace($NOTION_AUTO_DB_ID)) {
+        return @{ ok=$false; error='ATOMARCADE_NOTION_AUTO_DB_ID not set' }
+    }
+
+    $uptimeSec = [int]((Get-Date) - $script:Started).TotalSeconds
+    $proc = Get-Process -Id $PID
+
+    $props = @{
+        Name = @{ title = @(@{ text = @{ content = "Heartbeat - $($script:Hostname)" } }) }
+        Enabled = @{ checkbox = $true }
+        Kind = @{ select = @{ name = 'heartbeat' } }
+        Command = @{ rich_text = @(@{ text = @{ content = "SYSTEM_HEARTBEAT" } }) }
+        "Interval (sec)" = @{ number = $HEARTBEAT_SECONDS }
+        "Last Run" = @{ date = @{ start = (Get-Date).ToString('o') } }
+        "Run Count" = @{ number = $script:Metrics.heartbeat_writes_total + 1 }
+        "Last Result" = @{ rich_text = @(@{ text = @{ content = "uptime=${uptimeSec}s,mem=$([math]::Round($proc.WorkingSet64/1MB,1))MB,cpu=$([math]::Round($proc.TotalProcessorTime.TotalSeconds,1))s" } }) }
+    }
+
+    $body = @{ parent = @{ database_id = $NOTION_AUTO_DB_ID }; properties = $props } | ConvertTo-Json -Depth 10
+
+    try {
+        $r = Invoke-RestMethod -Uri 'https://api.notion.com/v1/pages' `
+            -Method Post -Headers $script:NotionHeaders -Body $body -TimeoutSec 15
+        $script:LastHeartbeat = Get-Date
+        $script:Metrics.heartbeat_writes_total++
+        Write-LocalJsonLog -Event 'heartbeat' -Level 'info' -Kind 'heartbeat' -Origin 'bridge' -Command 'SYSTEM_HEARTBEAT' -Status 'ok' -Result $r.id
+        Add-LogEntry -Kind 'HEARTBEAT' -Message "Heartbeat written to Automations DB (uptime: ${uptimeSec}s)"
+        return @{ ok=$true; page_id=$r.id; uptime_seconds=$uptimeSec }
+    } catch {
+        Write-LocalJsonLog -Event 'heartbeat' -Level 'error' -Kind 'heartbeat' -Origin 'bridge' -Command 'SYSTEM_HEARTBEAT' -Status 'fail' -Result $_.Exception.Message
+        Add-LogEntry -Kind 'HEARTBEAT_ERR' -Message $_.Exception.Message
+        return @{ ok=$false; error=$_.Exception.Message }
     }
 }
 
@@ -887,6 +934,12 @@ $DASHBOARD_HTML = @'
   </div>
 
   <div class="card">
+    <h2>Heartbeat Monitor <span id="heartbeat-pill" class="status-pill pill-warn">checking</span></h2>
+    <div class="kv" id="heartbeat-kv"></div>
+    <div class="small-muted" style="margin-top:6px">Alert if gap > 30 minutes (indicates bridge process death)</div>
+  </div>
+
+  <div class="card">
     <h2>Command Queue <span id="commands-pill" class="status-pill pill-warn">checking</span></h2>
     <div class="queue-form">
       <input id="q-command" type="text" placeholder="Command (e.g. PING)"/>
@@ -1043,6 +1096,20 @@ async function refreshAutomationCenter(){
         <div class="mini-meta">${esc(shortText(r.payload,160))}</div>
       </div>`);
   }catch(e){setPill('logs-pill','bad','error')}
+
+  try{
+    const hb=await j('/api/heartbeat/status');
+    const gapSec=hb.gap_seconds||0;
+    const gapText=gapSec===2147483647?'never':`${Math.floor(gapSec/60)}m ${Math.floor(gapSec%60)}s`;
+    setPill('heartbeat-pill',hb.ok?'ok':'bad',hb.is_stale?'STALE':'healthy');
+    kv(document.getElementById('heartbeat-kv'),{
+      'Last heartbeat':fmtTime(hb.last_heartbeat),
+      'Gap':gapText,
+      'Status':hb.is_stale?'STALE':'healthy',
+      'Interval':`${hb.heartbeat_interval}s`,
+      'Total heartbeats':hb.total_heartbeats||0
+    });
+  }catch(e){setPill('heartbeat-pill','bad','error')}
 }
 
 refresh();
@@ -1104,12 +1171,18 @@ if ($NOTION_ENABLED) {
 Write-Host ""; Write-Host "  Open: http://localhost:$HTTP_PORT/"; Write-Host "  Stop: Ctrl+C"; Write-Host ""
 
 if ($NOTION_ENABLED) { $script:LastNotionPoll = [datetime]::MinValue }
+if ($NOTION_ENABLED) { $script:LastHeartbeat = [datetime]::MinValue }
 
 try {
     while ($listener.IsListening) {
         if ($NOTION_ENABLED -and ((Get-Date) - $script:LastNotionPoll).TotalSeconds -ge $NOTION_POLL_SECONDS) {
             $script:LastNotionPoll = Get-Date
             Tick-NotionPoller
+        }
+
+        # Heartbeat mechanism (v0.6.8.6)
+        if ($NOTION_ENABLED -and ((Get-Date) - $script:LastHeartbeat).TotalSeconds -ge $HEARTBEAT_SECONDS) {
+            Write-Heartbeat
         }
 
         $asyncResult = $listener.BeginGetContext($null, $null)
@@ -1158,6 +1231,18 @@ try {
                 '^GET /api/commands/problem$' { Write-Json -Context $ctx -Object (Get-CommandsProblem); break }
                 '^GET /api/logs/recent$' { Write-Json -Context $ctx -Object (Get-LogsRecent); break }
                 '^GET /api/soak/status$' { Write-Json -Context $ctx -Object (Get-SoakStatus); break }
+                '^GET /api/heartbeat/status$' {
+                    $gap = if ($script:LastHeartbeat -eq [datetime]::MinValue) { [int]::MaxValue } else { [int]((Get-Date) - $script:LastHeartbeat).TotalSeconds }
+                    $isStale = $gap -gt 1800  # 30 minutes
+                    Write-Json -Context $ctx -Object @{
+                        ok = -not $isStale
+                        last_heartbeat = if ($script:LastHeartbeat -eq [datetime]::MinValue) { 'never' } else { $script:LastHeartbeat.ToString('o') }
+                        gap_seconds = $gap
+                        is_stale = $isStale
+                        heartbeat_interval = $HEARTBEAT_SECONDS
+                        total_heartbeats = $script:Metrics.heartbeat_writes_total
+                    }; break
+                }
 
                 '^POST /api/commands/queue$' {
                     $body = Read-JsonBody -Context $ctx
