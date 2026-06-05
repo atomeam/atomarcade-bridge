@@ -6,6 +6,17 @@
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
+# Transcript logging (v0.6.8.6 - for Task Scheduler diagnostics)
+# Starts transcript for persistent logging when running as scheduled task
+# ============================================================
+$transcriptPath = Join-Path $PSScriptRoot "homebase-transcript-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+try {
+    Start-Transcript -Path $transcriptPath -Append -ErrorAction SilentlyContinue
+} catch {
+    # Transcript may fail if file locked, continue without it
+}
+
+# ============================================================
 # Config
 # ============================================================
 $HTTP_PORT       = 8080
@@ -1163,6 +1174,17 @@ try { $listener.Start() } catch {
 Add-LogEntry -Kind 'BOOT' -Message "Home Base $VERSION listening on http://localhost:$HTTP_PORT/"
 Write-Log "BOOT homebase.ps1 $VERSION started by $env:USERNAME on $($script:Hostname) listening on http://localhost:$HTTP_PORT/"
 Write-LocalJsonLog -Event 'boot' -Level 'info' -Kind 'lifecycle' -Origin 'bridge' -Status 'ok' -Result "$VERSION listening on http://localhost:$HTTP_PORT/"
+
+# Environment variable diagnostics (v0.6.8.6 - for S4U task troubleshooting)
+$envDiagnostics = @{
+    'ATOMARCADE_NOTION_TOKEN' = if ([string]::IsNullOrWhiteSpace($env:ATOMARCADE_NOTION_TOKEN)) { 'MISSING' } else { "PRESENT (length: $($env:ATOMARCADE_NOTION_TOKEN.Length))" }
+    'ATOMARCADE_NOTION_DB_ID' = if ([string]::IsNullOrWhiteSpace($env:ATOMARCADE_NOTION_DB_ID)) { 'MISSING' } else { "PRESENT (length: $($env:ATOMARCADE_NOTION_DB_ID.Length))" }
+    'ATOMARCADE_NOTION_AUTO_DB_ID' = if ([string]::IsNullOrWhiteSpace($env:ATOMARCADE_NOTION_AUTO_DB_ID)) { 'MISSING' } else { "PRESENT (length: $($env:ATOMARCADE_NOTION_AUTO_DB_ID.Length))" }
+    'ATOMARCADE_NOTION_LOG_DB_ID' = if ([string]::IsNullOrWhiteSpace($env:ATOMARCADE_NOTION_LOG_DB_ID)) { 'MISSING (using fallback)' } else { "PRESENT (length: $($env:ATOMARCADE_NOTION_LOG_DB_ID.Length))" }
+}
+Add-LogEntry -Kind 'BOOT' -Message "Env var diagnostics: $($envDiagnostics | ConvertTo-Json -Compress)"
+Write-Log "ENV DIAGNOSTICS: $($envDiagnostics | ConvertTo-Json -Compress)"
+
 if ($NOTION_ENABLED) {
     Add-LogEntry -Kind 'BOOT' -Message "Notion Command Bus enabled (poll every ${NOTION_POLL_SECONDS}s)"
 } else {
@@ -1291,4 +1313,5 @@ try {
     Add-LogEntry -Kind 'SHUTDOWN' -Message 'Home Base stopped'
     Write-Log "SHUTDOWN homebase.ps1 $VERSION stopped"
     Write-LocalJsonLog -Event 'shutdown' -Level 'info' -Kind 'lifecycle' -Origin 'bridge' -Status 'ok' -Result "$VERSION stopped cleanly"
+    try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
 }

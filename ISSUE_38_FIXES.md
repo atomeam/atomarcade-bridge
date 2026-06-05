@@ -95,20 +95,30 @@ pwsh -File setup-taskscheduler.ps1
 # - setup-taskscheduler.ps1
 ```
 
-### Step 3: Setup Task Scheduler (Run as Administrator)
+### Step 3: Set Environment Variables (CRITICAL for S4U Tasks)
+```powershell
+# Set as SYSTEM environment variables (Machine scope) - REQUIRED for S4U tasks
+# Run as Administrator
+[System.Environment]::SetEnvironmentVariable('ATOMARCADE_NOTION_TOKEN', 'your-token', 'Machine')
+[System.Environment]::SetEnvironmentVariable('ATOMARCADE_NOTION_DB_ID', 'your-db-id', 'Machine')
+[System.Environment]::SetEnvironmentVariable('ATOMARCADE_NOTION_AUTO_DB_ID', 'your-auto-db-id', 'Machine')
+# Optional: ATOMARCADE_NOTION_LOG_DB_ID (has fallback if not set)
+```
+
+### Step 4: Setup Task Scheduler (Run as Administrator)
 ```powershell
 cd C:\Users\adamm\atomarcade-bridge
 pwsh -File setup-taskscheduler.ps1
 ```
 
-### Step 4: Restart Bridge
+### Step 5: Restart Bridge
 ```powershell
 # Stop existing bridge (Ctrl+C in current session)
 # Start new bridge:
 pwsh -File homebase.ps1
 ```
 
-### Step 5: Verify Heartbeat
+### Step 6: Verify Heartbeat
 ```powershell
 # Check heartbeat status via API:
 Invoke-RestMethod -Uri 'http://localhost:8080/api/heartbeat/status'
@@ -118,13 +128,53 @@ Invoke-RestMethod -Uri 'http://localhost:8080/api/heartbeat/status'
 # Look for "Heartbeat Monitor" card
 ```
 
-### Step 6: Test Monitoring
+### Step 7: Test Monitoring
 ```powershell
 # Manually trigger heartbeat monitor:
 Start-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor'
 
 # Check monitor log:
 Get-Content heartbeat-monitor.log
+```
+
+## Smoke Test Checklist (Production Readiness)
+
+### 1) Verify Heartbeat Writes
+```powershell
+# Wait 5-10 minutes after bridge start
+# Check Automations DB for "Heartbeat - {hostname}" rows
+# Verify rows appear every ~5 minutes with uptime/memory/CPU stats
+```
+
+### 2) Test Monitor Alerting
+```powershell
+# Temporarily stop bridge (Ctrl+C)
+# Wait >30 minutes (or edit heartbeat-monitor.ps1: $ALERT_THRESHOLD_MINUTES = 1)
+# Verify monitor detects staleness via /api/heartbeat/status
+# Check Logs DB for alert record with "HEARTBEAT ALERT" event
+```
+
+### 3) Test Watchdog Restart
+```powershell
+# Kill bridge process (Get-Process pwsh | Stop-Process -Force)
+# Verify Task Scheduler restarts bridge within 5 minutes
+# Check homebase-transcript-*.log for restart evidence
+# Verify bridge doesn't require interactive login
+```
+
+### 4) Task Configuration Verification
+```powershell
+# Check both tasks' "Last Run Result" after:
+# 1) Normal run: should be "0 (0x0)"
+# 2) Forced failure: should restart bridge
+# 3) Reboot test: should start automatically at boot
+
+# Verify task settings:
+# - Start in: C:\Users\adamm\atomarcade-bridge
+# - Run whether user is logged on or not: Yes
+# - Run with highest privileges: Yes
+# - Stop if runs longer than: Disabled (bridge task)
+# - Multiple instances: StopExisting (both tasks)
 ```
 
 ## Verification Checklist
@@ -154,16 +204,16 @@ Invoke-RestMethod -Uri 'http://localhost:8080/api/heartbeat/status' | ConvertTo-
 # Heartbeat monitor log (script-level)
 Get-Content C:\Users\adamm\atomarcade-bridge\heartbeat-monitor.log -Tail 20
 
-# Heartbeat monitor task log (Task Scheduler output)
-Get-Content C:\Users\adamm\atomarcade-bridge\heartbeat-monitor-task.log -Tail 20
+# Heartbeat monitor task logs (timestamped per run)
+Get-ChildItem C:\Users\adamm\atomarcade-bridge\heartbeat-monitor-task-*.log | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content -Tail 20
 
-# Bridge log
+# Bridge log (legacy)
 Get-Content C:\Users\adamm\atomarcade-bridge\homebase.log -Tail 20
 
-# Bridge task log (Task Scheduler output)
-Get-Content C:\Users\adamm\atomarcade-bridge\bridge-task.log -Tail 20
+# Bridge transcript logs (Start-Transcript - preferred for Task Scheduler)
+Get-ChildItem C:\Users\adamm\atomarcade-bridge\homebase-transcript-*.log | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | Get-Content -Tail 20
 
-# Bridge JSONL log
+# Bridge JSONL log (structured events)
 Get-Content C:\Users\adamm\atomarcade-bridge\homebase-logs.jsonl -Tail 10
 ```
 
@@ -199,16 +249,20 @@ Start-ScheduledTask -TaskName 'AtomArcade-Bridge'
 **Recovery:** Task Scheduler auto-restarts bridge on next wake (if configured with AtStartup trigger)
 **Mitigation:** Task Scheduler tasks use S4U logon type (runs whether user logged on or not)
 
-### Missing Environment Variables
-**Symptom:** Bridge fails to start or heartbeat writes fail
-**Detection:** Check bridge-task.log for "ATOMARCADE_NOTION_TOKEN not set" errors
-**Recovery:** Set required env vars:
+### Missing Environment Variables (S4U Critical)
+**Symptom:** Bridge fails to start or heartbeat writes fail when running as S4U task
+**Detection:** Check homebase-transcript-*.log for "ENV DIAGNOSTICS" showing MISSING vars
+**Root Cause:** S4U tasks only see Machine-scope env vars, not User-scope
+**Recovery:** Set required env vars as SYSTEM (Machine scope):
 ```powershell
-# Set system environment variables (requires admin)
+# CRITICAL: Must use Machine scope for S4U tasks
+# Run as Administrator
 [System.Environment]::SetEnvironmentVariable('ATOMARCADE_NOTION_TOKEN', 'your-token', 'Machine')
 [System.Environment]::SetEnvironmentVariable('ATOMARCADE_NOTION_DB_ID', 'your-db-id', 'Machine')
 [System.Environment]::SetEnvironmentVariable('ATOMARCADE_NOTION_AUTO_DB_ID', 'your-auto-db-id', 'Machine')
+# Optional: ATOMARCADE_NOTION_LOG_DB_ID (has fallback if not set)
 ```
+**Verification:** Bridge logs env var diagnostics at startup showing "PRESENT (length: XX)"
 
 ### Notion API Errors
 **Symptom:** Heartbeat writes fail, alerts still fire
@@ -284,6 +338,50 @@ Remove-Item ISSUE_38_FIXES.md
 # 4. Restart bridge manually
 pwsh -File homebase.ps1
 ```
+
+## Production-Ready Logging Strategy
+
+### Logging Architecture (v0.6.8.6)
+
+**Heartbeat Monitor (Short-Lived, Frequent Runs)**
+- Uses timestamped log files per run: `heartbeat-monitor-task-YYYYMMDD-HHMMSS.log`
+- Prevents file lock issues with frequent runs
+- Shell redirection: `*> "$heartbeatLog"` captures stdout/stderr
+- Script-level logging: `heartbeat-monitor.log` (append mode)
+
+**Bridge (Long-Lived, Continuous)**
+- Uses PowerShell `Start-Transcript` for comprehensive logging
+- Timestamped transcript files: `homebase-transcript-YYYYMMDD-HHMMSS.log`
+- No shell redirection (prevents file handle issues with long-running process)
+- Internal logging: `homebase.log` (legacy), `homebase-logs.jsonl` (structured events)
+- Environment variable diagnostics logged at startup for S4U troubleshooting
+
+**Why This Strategy Works:**
+- Timestamped logs prevent file lock contention
+- Start-Transcript handles long-running processes gracefully
+- Multiple log layers provide redundancy and debugging depth
+- S4U env var diagnostics catch configuration issues early
+
+### Task Configuration Details
+
+**Both Tasks Share These Settings:**
+- **Start in (Working Directory):** `C:\Users\adamm\atomarcade-bridge`
+- **Run whether user is logged on or not:** Yes (S4U logon type)
+- **Run with highest privileges:** Yes (required for port binding)
+- **Multiple Instances:** StopExisting (prevents duplicate processes)
+
+**Heartbeat Monitor Specific:**
+- **Trigger:** Every 10 minutes (repeating)
+- **Execution Time Limit:** Default (3 days)
+- **Stop if runs longer than:** Enabled (default)
+- **Restart on failure:** Not configured (monitor is disposable)
+
+**Bridge Specific:**
+- **Trigger:** At system startup
+- **Execution Time Limit:** 365 days (effectively unlimited)
+- **Stop if runs longer than:** Disabled (long-running process)
+- **Restart on failure:** 3 retries, 5-minute intervals
+- **Restart on idle:** Enabled
 
 ## Acceptance Criteria Met
 
