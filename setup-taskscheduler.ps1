@@ -12,6 +12,18 @@ $monitorScript = Join-Path $scriptPath 'heartbeat-monitor.ps1'
 $taskNameHeartbeat = 'AtomArcade-HeartbeatMonitor'
 $taskNameBridge = 'AtomArcade-Bridge'
 
+# Find PowerShell executable path
+$pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue).Source
+if ([string]::IsNullOrWhiteSpace($pwshPath)) {
+    Write-Log "ERROR: pwsh.exe not found in PATH"
+    exit 1
+}
+Write-Log "PowerShell path: $pwshPath"
+
+# Log file paths for task output
+$heartbeatLog = Join-Path $scriptPath 'heartbeat-monitor-task.log'
+$bridgeLog = Join-Path $scriptPath 'bridge-task.log'
+
 function Write-Log {
     param([string]$Message)
     $timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
@@ -40,28 +52,25 @@ try {
 
 # Create Heartbeat Monitor Task
 Write-Log "Creating Heartbeat Monitor task..."
-$action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument "-File `"$monitorScript`"" -WorkingDirectory $scriptPath
+$action = New-ScheduledTaskAction -Execute $pwshPath -Argument "-File `"$monitorScript`" *> `"$heartbeatLog`"" -WorkingDirectory $scriptPath
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 10)
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
 Register-ScheduledTask -TaskName $taskNameHeartbeat -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "AtomArcade Bridge Heartbeat Monitor - checks every 10 minutes for stale heartbeat" | Out-Null
 Write-Log "Heartbeat Monitor task created: $taskNameHeartbeat"
+Write-Log "Task output log: $heartbeatLog"
 
 # Create Bridge Auto-Restart Task
 Write-Log "Creating Bridge Auto-Restart task..."
-$action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument "-File `"$homebaseScript`"" -WorkingDirectory $scriptPath
+$action = New-ScheduledTaskAction -Execute $pwshPath -Argument "-File `"$homebaseScript`" *> `"$bridgeLog`"" -WorkingDirectory $scriptPath
 $trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5)
 
 Register-ScheduledTask -TaskName $taskNameBridge -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "AtomArcade Bridge Auto-Restart - starts at boot, restarts on failure" | Out-Null
 Write-Log "Bridge Auto-Restart task created: $taskNameBridge"
-
-# Configure task to run whether user is logged on or not
-Write-Log "Configuring tasks to run whether user is logged on or not..."
-Set-ScheduledTask -TaskName $taskNameHeartbeat -Principal (New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Highest)
-Set-ScheduledTask -TaskName $taskNameBridge -Principal (New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Highest)
+Write-Log "Task output log: $bridgeLog"
 
 Write-Log "Task Scheduler setup completed successfully!"
 Write-Log ""

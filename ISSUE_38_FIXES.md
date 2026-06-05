@@ -151,11 +151,17 @@ Invoke-RestMethod -Uri 'http://localhost:8080/api/heartbeat/status' | ConvertTo-
 
 ### Check Monitor Logs
 ```powershell
-# Heartbeat monitor log
+# Heartbeat monitor log (script-level)
 Get-Content C:\Users\adamm\atomarcade-bridge\heartbeat-monitor.log -Tail 20
+
+# Heartbeat monitor task log (Task Scheduler output)
+Get-Content C:\Users\adamm\atomarcade-bridge\heartbeat-monitor-task.log -Tail 20
 
 # Bridge log
 Get-Content C:\Users\adamm\atomarcade-bridge\homebase.log -Tail 20
+
+# Bridge task log (Task Scheduler output)
+Get-Content C:\Users\adamm\atomarcade-bridge\bridge-task.log -Tail 20
 
 # Bridge JSONL log
 Get-Content C:\Users\adamm\atomarcade-bridge\homebase-logs.jsonl -Tail 10
@@ -183,6 +189,100 @@ Start-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor'
 # Restart bridge
 Stop-ScheduledTask -TaskName 'AtomArcade-Bridge'
 Start-ScheduledTask -TaskName 'AtomArcade-Bridge'
+```
+
+## Failure Mode Handling
+
+### Sleep/Hibernate Scenarios
+**Symptom:** Bridge stops writing heartbeats after laptop sleep/hibernate
+**Detection:** Heartbeat gap > 30 minutes triggers alert
+**Recovery:** Task Scheduler auto-restarts bridge on next wake (if configured with AtStartup trigger)
+**Mitigation:** Task Scheduler tasks use S4U logon type (runs whether user logged on or not)
+
+### Missing Environment Variables
+**Symptom:** Bridge fails to start or heartbeat writes fail
+**Detection:** Check bridge-task.log for "ATOMARCADE_NOTION_TOKEN not set" errors
+**Recovery:** Set required env vars:
+```powershell
+# Set system environment variables (requires admin)
+[System.Environment]::SetEnvironmentVariable('ATOMARCADE_NOTION_TOKEN', 'your-token', 'Machine')
+[System.Environment]::SetEnvironmentVariable('ATOMARCADE_NOTION_DB_ID', 'your-db-id', 'Machine')
+[System.Environment]::SetEnvironmentVariable('ATOMARCADE_NOTION_AUTO_DB_ID', 'your-auto-db-id', 'Machine')
+```
+
+### Notion API Errors
+**Symptom:** Heartbeat writes fail, alerts still fire
+**Detection:** Check heartbeat-monitor-task.log for Notion API errors
+**Recovery:** Script fails gracefully, continues monitoring, retries on next run
+**Mitigation:** Logs DB fallback prevents silent failures (v0.6.3 feature)
+
+### Task Permission Issues
+**Symptom:** Tasks fail to start or run with insufficient privileges
+**Detection:** Check Task Scheduler history for "0x1" or "0x41301" error codes
+**Recovery:** Re-run setup-taskscheduler.ps1 as Administrator
+**Mitigation:** Tasks configured with RunLevel Highest and S4U logon type
+
+### PowerShell Not Found
+**Symptom:** Tasks fail with "pwsh.exe not found"
+**Detection:** Check setup-taskscheduler.log for path resolution errors
+**Recovery:** Install PowerShell 7+ or update $pwshPath in setup script
+**Mitigation:** Setup script now validates pwsh.exe path before creating tasks
+
+## Rollback Procedure
+
+### If Heartbeat Causes Issues
+```powershell
+# 1. Stop monitoring
+Stop-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor'
+
+# 2. Revert to previous version
+cd C:\Users\adamm\atomarcade-bridge
+git log --oneline
+git checkout <previous-commit-hash>
+
+# 3. Restart bridge manually
+pwsh -File homebase.ps1
+```
+
+### If Task Scheduler Tasks Fail
+```powershell
+# 1. Remove tasks
+Unregister-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor' -Confirm:$false
+Unregister-ScheduledTask -TaskName 'AtomArcade-Bridge' -Confirm:$false
+
+# 2. Run bridge manually
+cd C:\Users\adamm\atomarcade-bridge
+pwsh -File homebase.ps1
+```
+
+### If Monitoring Causes False Alerts
+```powershell
+# 1. Adjust alert threshold in heartbeat-monitor.ps1
+# Edit $ALERT_THRESHOLD_MINUTES = 30 to desired value
+
+# 2. Restart monitor
+Stop-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor'
+Start-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor'
+```
+
+### Complete Rollback to Pre-Fix State
+```powershell
+# 1. Remove Task Scheduler tasks
+Unregister-ScheduledTask -TaskName 'AtomArcade-HeartbeatMonitor' -Confirm:$false
+Unregister-ScheduledTask -TaskName 'AtomArcade-Bridge' -Confirm:$false
+
+# 2. Revert code changes
+cd C:\Users\adamm\atomarcade-bridge
+git log --oneline
+git checkout <commit-before-fixes>
+
+# 3. Remove new files
+Remove-Item heartbeat-monitor.ps1
+Remove-Item setup-taskscheduler.ps1
+Remove-Item ISSUE_38_FIXES.md
+
+# 4. Restart bridge manually
+pwsh -File homebase.ps1
 ```
 
 ## Acceptance Criteria Met
