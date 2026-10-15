@@ -1,7 +1,18 @@
+import os
+import sys
+
 import sentry_sdk
 
+# The DSN is read from the environment; it must never be committed.
+dsn = os.environ.get("SENTRY_DSN", "").strip()
+if not dsn:
+    sys.exit(
+        "SENTRY_DSN is not set. Set it to the project's DSN "
+        "(Sentry: Project Settings > Client Keys (DSN)) and run again."
+    )
+
 sentry_sdk.init(
-    dsn="https://4b455e8b7ec5c38ba72028e4d4fe8dcf@o4511372330205184.ingest.us.sentry.io/4511374330363904",
+    dsn=dsn,
     traces_sample_rate=1.0,
     environment="ci",
     release="atomarcade-bridge@0.0.1",
